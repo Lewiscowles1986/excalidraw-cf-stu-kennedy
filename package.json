@@ -4,8 +4,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "$npm_execpath run build && vite preview",
-    "deploy": "$npm_execpath run build && wrangler deploy",
+    "preview": "\"${npm_execpath:-npm}\" run build && vite preview",
+    "deploy": "\"${npm_execpath:-npm}\" run build && wrangler deploy",
     "cf-typegen": "wrangler types --env-interface CloudflareBindings"
   },
   "dependencies": {
@@ -14,7 +14,7 @@
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.2.3",
-    "@cloudflare/workers-types": "^4.20260317.1",
+    "@cloudflare/workers-types": "^5.20260911.1",
     "vite": "^6.3.5",
     "vite-ssr-components": "^0.5.2",
     "wrangler": "^4.17.0"
