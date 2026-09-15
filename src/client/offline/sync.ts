@@ -50,6 +50,11 @@ export function currentRoomId(): string | null {
   return currentRoom;
 }
 
+/** The base revision the local snapshot was last reconciled against. */
+export function currentRevision(): number {
+  return currentBase.revision;
+}
+
 /** Append a user mutation to the outbox and mark the room dirty. */
 export async function enqueue(roomId: string, op: OfflineOp, revision: number): Promise<void> {
   await db.appendEvent(roomId, op, revision);

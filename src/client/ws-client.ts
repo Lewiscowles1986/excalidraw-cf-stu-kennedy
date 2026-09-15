@@ -2,6 +2,8 @@ import type { ExcalidrawElement } from './types';
 import type { ClientMessage, ServerMessage } from '../types/protocol';
 import { store } from './state';
 import { updateRemoteCursor, removeRemoteCursor } from './renderer';
+import { enqueue, currentRevision, currentRoomId } from './offline';
+import { isOnline } from './offline/connectivity';
 
 class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -89,12 +91,12 @@ class WebSocketClient {
         store.updateElements(msg.elements);
         break;
       case 'element-update':
-        if (msg.senderId !== this.userId) {
+        if (msg.senderId !== this.userId && msg.senderId !== 'offline-sync') {
           store.updateElements(msg.elements);
         }
         break;
       case 'element-delete':
-        if (msg.senderId !== this.userId) {
+        if (msg.senderId !== this.userId && msg.senderId !== 'offline-sync') {
           for (const id of msg.elementIds) {
             store.deleteElement(id);
           }
@@ -118,33 +120,33 @@ class WebSocketClient {
   }
 
   sendElementUpdate(elements: ExcalidrawElement[]): void {
+    // Always persist to the local copy first (offline-first write path).
+    if (this.roomId) {
+      void enqueue(this.roomId, { type: 'element-update', elements }, currentRevision());
+    }
+    // When the socket is live, also send immediately.
     if (this.isConnected()) {
       this.send({ type: 'element-update', elements });
-    } else if (this.roomId) {
-      // Fallback: persist via HTTP when WS is not available
-      this.saveViaHttp(elements);
     }
   }
 
   sendElementDelete(elementIds: string[]): void {
+    if (this.roomId) {
+      void enqueue(this.roomId, { type: 'element-delete', elementIds }, currentRevision());
+    }
     if (this.isConnected()) {
       this.send({ type: 'element-delete', elementIds });
-    } else if (this.roomId) {
-      // Fallback: mark as deleted via HTTP
-      const deletedElements = elementIds.map(id => {
-        const el = store.getElement(id);
-        return el ? { ...el, isDeleted: true } : null;
-      }).filter(Boolean);
-      if (deletedElements.length > 0) {
-        this.saveViaHttp(deletedElements as ExcalidrawElement[]);
-      }
     }
   }
 
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingElements: Map<string, ExcalidrawElement> = new Map();
 
+  // Legacy HTTP fallback kept for the flush-all periodic backup path. It is
+  // only safe while we are actually online; offline edits flow through the
+  // IndexedDB outbox instead, so nothing is dropped.
   private saveViaHttp(elements: ExcalidrawElement[]): void {
+    if (!isOnline()) return;
     for (const el of elements) {
       this.pendingElements.set(el.id, el);
     }
@@ -172,7 +174,7 @@ class WebSocketClient {
 
   /** Flush all current elements to the DO via HTTP - used as periodic backup */
   flushAll(): void {
-    if (!this.roomId) return;
+    if (!this.roomId || !isOnline()) return;
     const elements = Array.from(store.elements.values());
     if (elements.length > 0) {
       fetch(`/api/rooms/${this.roomId}/elements`, {

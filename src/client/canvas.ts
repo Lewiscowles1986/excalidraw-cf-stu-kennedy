@@ -6,6 +6,10 @@ import { setupBridge } from './bridge';
 import { store } from './state';
 import { worldToScreen } from './camera';
 import { wsClient } from './ws-client';
+import { startConnectivityMonitor } from './offline/connectivity';
+import { registerServiceWorker } from './offline/service-worker';
+import { startRoom, syncIfNeeded } from './offline/sync';
+import { setupOfflineUI } from './offline/offline-ui';
 
 let canvas: HTMLCanvasElement;
 let animationId: number;
@@ -22,6 +26,11 @@ export function init(): void {
   setupShortcuts();
   setupBridge();
 
+  // Offline-first: register the service worker and start connectivity detection.
+  registerServiceWorker();
+  startConnectivityMonitor();
+  setupOfflineUI();
+
   // Center the view
   store.setAppState({
     scrollX: window.innerWidth / 2,
@@ -32,10 +41,15 @@ export function init(): void {
   const match = location.pathname.match(/^\/d\/(.+)$/);
   if (match) {
     const roomId = match[1];
-    // Load elements via HTTP first (works in dev + prod)
-    loadElements(roomId);
-    // Then connect WebSocket for live sync (may fail in dev)
-    wsClient.connect(roomId);
+    // Restore any cached local state first (works fully offline), then
+    // attempt network + live sync.
+    startRoom(roomId).then(() => {
+      wsClient.connect(roomId);
+      // Ask the sync engine to reconcile once we're connected.
+      setTimeout(() => {
+        void syncIfNeeded(roomId);
+      }, 0);
+    });
     // Periodic auto-save as backup (catches any missed persistence)
     setInterval(() => {
       if (!wsClient.isConnected() && store.elements.size > 0) {

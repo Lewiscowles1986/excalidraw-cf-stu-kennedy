@@ -1,9 +1,15 @@
 import type { ExcalidrawElement } from './elements';
 
+// The subset of client messages that mutate the canvas. Both the live
+// WebSocket protocol and the offline outbox use these same shapes, so edits
+// queue offline can later be replayed to the server unchanged.
+export type MutationMessage =
+  | { type: 'element-update'; elements: ExcalidrawElement[] }
+  | { type: 'element-delete'; elementIds: string[] };
+
 // Client -> Server messages
 export type ClientMessage =
-  | { type: 'element-update'; elements: ExcalidrawElement[] }
-  | { type: 'element-delete'; elementIds: string[] }
+  | MutationMessage
   | { type: 'cursor-move'; userId: string; x: number; y: number; username: string }
   | { type: 'request-sync' }
   | { type: 'ping' };

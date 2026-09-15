@@ -6,6 +6,7 @@ export {
   forkRoom,
   answerFork,
   currentRoomId,
+  currentRevision,
 } from './sync';
 export {
   isOnline,

@@ -959,3 +959,41 @@ kbd {
   background: var(--text);
   border-radius: 2px;
 }
+
+/* === Offline-first: status banner + fork modal === */
+.offline-banner {
+  position: fixed;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1200;
+  background: #b5472e;
+  color: #fff;
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 0 0 10px 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+
+.offline-banner.syncing {
+  background: #3b7dd8;
+}
+
+.offline-banner.warning {
+  background: #b8860b;
+}
+
+.fork-overlay {
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 0 20px 20px;
+}
+

@@ -1,12 +1,15 @@
 import type { ExcalidrawElement } from './elements';
+import type { MutationMessage } from './protocol';
 
 // A single offline operation captured in the outbox. Every user mutation is
 // appended to the room's event log *before* any attempt to reach the server,
 // so the client remains the source of truth while offline. On reconnect the
 // log is replayed to the server.
-export type OfflineOp =
-  | { type: 'element-update'; elements: ExcalidrawElement[] }
-  | { type: 'element-delete'; elementIds: string[] };
+//
+// This derives from the shared MutationMessage so the offline outbox can never
+// drift from the live WebSocket protocol — edits queued offline replay against
+// the server unchanged.
+export type OfflineOp = MutationMessage;
 
 // The per-room snapshot stored in IndexedDB. It is the durable client-side
 // copy of the canvas, kept even when the server is unreachable.
