@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// Use a dedicated port so these tests never collide with, or reuse, a stale
+// dev server running our code from another worktree (which happened often
+// because multiple excalidraw-cf-* worktrees bind 5173 by default).
+const PORT = 5199;
+
 export default defineConfig({
   testDir: './tests',
   timeout: 60_000,
@@ -7,7 +12,7 @@ export default defineConfig({
   retries: 0,
   reporter: [['list']],
   use: {
-    baseURL: 'http://localhost:5173',
+    baseURL: `http://localhost:${PORT}`,
     trace: 'on-first-retry',
   },
   projects: [
@@ -17,9 +22,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev',
-    url: 'http://localhost:5173',
-    reuseExistingServer: !process.env.CI,
+    command: `npm run dev -- --port ${PORT} --strictPort`,
+    url: `http://localhost:${PORT}`,
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });
