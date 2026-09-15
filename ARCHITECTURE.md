@@ -96,3 +96,34 @@ The only writes to the SQLite `elements` table are **drawing geometry/shape prop
 2. **PII could arrive as user-authored content, not collected data.** It's a drawing app, so someone could type "John: (555) 123-4567" as a text shape. That's user-authored content on a shared canvas, not the app *collecting* PII — but any privacy policy / deletion guarantee would need to focus on canvas text, not the identity system.
 
 **Bottom line:** the app collects zero PII about users. The only held data is anonymous drawing content; user-supplied personal identifiers are impossible; and there is no tracking or cookie layer.
+
+---
+
+## Offline-first architecture
+
+The app is **local-first**: the browser is the source of truth while the backend is unreachable, and it reconciles with the server once connectivity returns.
+
+### Why "local-first" instead of "cache the server"
+
+Ordinary caching mirrors server state so you can *read* offline. Local-first goes further: you can also **write** offline, queueing those writes, then reconcile on reconnection. This keeps a shared canvas usable on a plane, train, or during a Cloudflare outage — and it's what enables turn-based play (e.g. a chess app where two players on separate offline copies take turns that later merge).
+
+### The pieces
+
+1. **Connectivity detection (`client/offline/connectivity.ts`)** defaults to **offline** and only flips online when *both* `navigator.onLine` and a `/api/ping` probe succeed. This avoids treating "machine has Wi-Fi" as "Cloudflare is reachable."
+2. **IndexedDB store (`client/offline/database.ts`)** keeps a per-room snapshot (`OfflineRoom`) plus an append-only **event log** (the outbox). A service worker (`public/sw.js`) precaches static assets so the app shell itself boots offline.
+3. **Outbox (`client/ws-client.ts`)** — every user mutation is appended to IndexedDB *before* any socket/HTTP send. The legacy `flushAll`/`saveViaHttp` paths are gated on connectivity so offline edits are never dropped.
+4. **Sync engine (`client/offline/sync.ts`)** replays the outbox to the server on reconnect via `PUT /api/rooms/:roomId/events`, sending its **base revision** so the server can detect divergence:
+   - **revision matches** → ops apply cleanly (`synced`), outbox drains, room marked clean.
+   - **no local edits since offline** → simply adopt the server snapshot (fast-forward).
+   - **both sides moved** → the server returns `diverged` with current state; the client offers to **fork** into a new room and replays the local event log there, *avoiding merge conflicts by never merging*.
+5. **Server (`do/drawing-room.ts`)** maintains a monotonic `revision` (via `ctx.storage`) bumped on every successful mutation (WebSocket + API + offline replay). `/state` returns revision + elements; `/events` applies a batch only when the client base still matches.
+6. **UI (`client/offline/offline-ui.ts`)** — a banner shows offline/pending state; a modal offers "Fork into new room" vs "Keep working offline" when divergence is detected.
+
+### Design notes / honest trade-offs
+
+- **No merge conflict resolution yet.** Forking is the *only* divergent strategy implemented. That is intentional and documented as out of scope: later strategies (field-level merge, LWW by timestamp) can plug into `handleDivergence`.
+- **`/events` replays the whole outbox as one batch.** For long offline sessions this grows; a later refinement could send a compaction (latest snapshot) instead of thousands of ops.
+- **Optimistic persistence caveat (from above) still applies:** the outbox records every in-flight edit, so incomplete gestures are persisted. Same fidelity concern as the live path.
+- **`OfflineOp` derives from `MutationMessage`** (`types/protocol.ts`) so the offline log can never drift from the live socket protocol.
+- **Testing:** Playwright tests in `tests/interactions.spec.ts` cover landing, draw-and-persist, offline banner, and offline queue→drain-on-reconnect using `context.setOffline`.
+

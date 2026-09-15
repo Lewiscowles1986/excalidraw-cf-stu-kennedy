@@ -163,5 +163,6 @@ bunx wrangler types --env-interface CloudflareBindings
 | `bun run preview` | Build, then serve the built output locally to preview it |
 | `bun run deploy` | Build, then `wrangler deploy` to ship it to the internet |
 | `bun run cf-typegen` | Generate Cloudflare TypeScript types from `wrangler.jsonc` |
+| `bun run test` | Run the Playwright interaction/offline test suite |
 
 That's everything you need to go from "what is this?" to "I just drew on a shared canvas with a friend across the internet." Have fun! 🎨
