@@ -36,12 +36,46 @@ export class DrawingRoom extends DurableObject {
     `);
   }
 
+  /** Monotonic room-level revision counter. Incremented on every successful mutation. */
+  private async getRevision(): Promise<number> {
+    return (await this.ctx.storage.get<number>('revision')) || 0;
+  }
+
+  private async bumpRevision(): Promise<number> {
+    const next = (await this.getRevision()) + 1;
+    await this.ctx.storage.put('revision', next);
+    return next;
+  }
+
+  /** The wall-clock of the most recent edit touching this room's elements. */
+  private getLastEditAt(): number {
+    const row = this.sql.exec('SELECT MAX(updated_at) AS max_ts FROM elements').one();
+    return (row?.max_ts as number) || 0;
+  }
+
   // HTTP handler for REST API
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/ws') {
       return this.handleWebSocket(request);
+    }
+
+    // Lightweight reachability probe for offline detection
+    if (url.pathname === '/ping') {
+      return Response.json({ ok: true });
+    }
+
+    // Full snapshot + metadata for offline reconciliation
+    if (url.pathname === '/state' && request.method === 'GET') {
+      return this.handleGetState();
+    }
+
+    // Offline outbox replay: apply a batch of ops IF the client's base
+    // revision still matches. Otherwise return the current state so the
+    // client can detect divergence and decide to resync or fork.
+    if (url.pathname === '/events' && request.method === 'PUT') {
+      return this.handlePutEvents(request);
     }
 
     if (url.pathname === '/elements') {
@@ -54,6 +88,71 @@ export class DrawingRoom extends DurableObject {
     }
 
     return new Response('Not found', { status: 404 });
+  }
+
+  private async handleGetState(): Promise<Response> {
+    const elements = this.loadAllElements();
+    return Response.json({
+      revision: await this.getRevision(),
+      lastEditAt: this.getLastEditAt(),
+      elements,
+    });
+  }
+
+  private async handlePutEvents(request: Request): Promise<Response> {
+    let body: { ops: any[]; baseRevision: number };
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ ok: false, error: 'invalid body' }, { status: 400 });
+    }
+
+    const { ops = [], baseRevision = 0 } = body;
+    const currentRevision = await this.getRevision();
+
+    // If the client's outbox was built on a stale snapshot, we cannot
+    // safely replay it — return the current state for the client to
+    // reconcile (resync or fork).
+    if (baseRevision !== currentRevision) {
+      return Response.json({
+        ok: false,
+        diverged: true,
+        revision: currentRevision,
+        lastEditAt: this.getLastEditAt(),
+        elements: this.loadAllElements(),
+      });
+    }
+
+    const upserts: ExcalidrawElement[] = [];
+    const deleteIds: string[] = [];
+
+    for (const op of ops) {
+      if (op.type === 'element-update') {
+        for (const el of op.elements) upserts.push(el);
+      } else if (op.type === 'element-delete') {
+        for (const id of op.elementIds || []) deleteIds.push(id);
+      }
+    }
+
+    if (upserts.length > 0) this.persistElements(upserts);
+    for (const id of deleteIds) {
+      this.sql.exec(
+        'UPDATE elements SET is_deleted = 1, updated_at = ? WHERE id = ?',
+        Date.now(), id
+      );
+    }
+
+    const revision = await this.bumpRevision();
+
+    // Broadcast live so any online collaborators see the reconciled state.
+    if (upserts.length > 0) {
+      this.broadcast({ type: 'element-update', elements: upserts, senderId: 'offline-sync' });
+    }
+    if (deleteIds.length > 0) {
+      this.broadcast({ type: 'element-delete', elementIds: deleteIds, senderId: 'offline-sync' });
+    }
+
+    return Response.json({ ok: true, revision, lastEditAt: this.getLastEditAt() });
   }
 
   private handleWebSocket(request: Request): Response {
@@ -115,28 +214,32 @@ export class DrawingRoom extends DurableObject {
 
   private handleClientMessage(ws: WebSocket, session: SessionInfo, msg: ClientMessage): void {
     switch (msg.type) {
-      case 'element-update':
-        this.persistElements(msg.elements);
+      case 'element-update': {
+        const changed = this.persistElements(msg.elements);
+        if (changed > 0) this.bumpRevision();
         this.broadcast({
           type: 'element-update',
           elements: msg.elements,
           senderId: session.userId,
         }, ws);
         break;
+      }
 
-      case 'element-delete':
+      case 'element-delete': {
         for (const id of msg.elementIds) {
           this.sql.exec(
             'UPDATE elements SET is_deleted = 1, updated_at = ? WHERE id = ?',
             Date.now(), id
           );
         }
+        this.bumpRevision();
         this.broadcast({
           type: 'element-delete',
           elementIds: msg.elementIds,
           senderId: session.userId,
         }, ws);
         break;
+      }
 
       case 'cursor-move':
         this.broadcast({
@@ -160,7 +263,8 @@ export class DrawingRoom extends DurableObject {
     }
   }
 
-  private persistElements(elements: ExcalidrawElement[]): void {
+  private persistElements(elements: ExcalidrawElement[]): number {
+    let changed = 0;
     for (const el of elements) {
       const existing = this.sql.exec(
         'SELECT version FROM elements WHERE id = ?', el.id
@@ -173,14 +277,17 @@ export class DrawingRoom extends DurableObject {
             'UPDATE elements SET type = ?, data = ?, version = ?, is_deleted = ?, updated_at = ? WHERE id = ?',
             el.type, JSON.stringify(el), el.version, el.isDeleted ? 1 : 0, Date.now(), el.id
           );
+          changed++;
         }
       } else {
         this.sql.exec(
           'INSERT INTO elements (id, type, data, version, is_deleted, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
           el.id, el.type, JSON.stringify(el), el.version, el.isDeleted ? 1 : 0, Date.now()
         );
+        changed++;
       }
     }
+    return changed;
   }
 
   private loadAllElements(): ExcalidrawElement[] {
