@@ -17,6 +17,92 @@ offline-first sync) lives in the Worker runtime and cannot run on a static host.
 
 ---
 
+## 0. The build graph, at a glance
+
+> Prefer a picture over prose? This Mermaid `graph TD` is the same system
+> described below, laid out in one view. Read it top-to-bottom: **source config
+> → build tooling → emitted artifacts → runtime.**
+
+```mermaid
+graph TD
+    %% ── Source config ──────────────────────────────
+    PKG(["package.json<br/><i>scripts + deps</i>"])
+    VTC["vite.config.ts"]
+    CFG["wrangler.jsonc"]
+
+    %% ── Build tooling ─────────────────────────────
+    VITE["vite build"]
+    PLUGIN1["@cloudflare/vite-plugin"]
+    PLUGIN2["vite-ssr-components"]
+    WRANGLER["wrangler deploy"]
+    TSC["tsc / types"]
+
+    %% ── Frontend (client) ─────────────────────────
+    CANVAS["src/client/canvas.ts<br/><i>client entry</i>"]
+    CSS["src/style.css"]
+
+    %% ── Backend (worker) ──────────────────────────
+    IDX["src/index.tsx<br/><i>Hono entry</i>"]
+    RDR["src/renderer.tsx<br/><i>SSR shell</i>"]
+    DO["src/do/drawing-room.ts<br/><i>Durable Object</i>"]
+    OFFLINE["src/client/offline/*"]
+
+    %% ── Emitted artifacts ─────────────────────────
+    MANI["dist/client/.vite/manifest.json"]
+    HASJH["dist/client/assets/canvas-&lt;hash&gt;.js"]
+    HASCSS["dist/client/assets/style-&lt;hash&gt;.css"]
+    SWGEN["dist/client/sw.js<br/><i>generated precache</i>"]
+    WORKER["dist/excalidraw_cf/index.js"]
+    SWT["service-worker.template.js"]
+
+    %% ── Edges: config drives build ─────────────────
+    VTC -- "loads" --> VITE
+    PKG -- "runs" --> VITE
+    VITE -- "invokes" --> PLUGIN1
+    VITE -- "invokes" --> PLUGIN2
+    PLUGIN1 -- "consumes" --> CFG
+    CFG -- "entry: main" --> IDX
+    CFG -- "binding + migration" --> DO
+
+    %% ── Frontend → client bundle ───────────────────
+    CANVAS -- "entry" --> VITE
+    CSS -- "entry" --> VITE
+    VITE -- "emit (hashed)" --> HASJH
+    VITE -- "emit (hashed)" --> HASCSS
+    MANI -- "index of hashed files" --> SWGEN
+
+    %% ── SW precache is generated, not hard-coded ───
+    SWT -- "template" --> VITE
+    VITE -- "inject precache from manifest" --> SWGEN
+    SWGEN -- "precache list" --> HASJH
+    SWGEN -- "precache list" --> HASCSS
+
+    %% ── Backend → worker bundle ────────────────────
+    IDX -- "SSR shell" --> RDR
+    IDX -- "imports offline" --> OFFLINE
+    VITE -- "emit SSR bundle" --> WORKER
+    WORKER -- "deployed by" --> WRANGLER
+
+    style PLUGIN1 fill:#4a90d9,color:#fff
+    style PLUGIN2 fill:#7a5aa9,color:#fff
+    style SWGEN fill:#2ea043,color:#fff
+    style WORKER fill:#d29922,color:#fff
+```
+
+### Reading it
+
+- **Config drives the build.** `package.json` scripts call `vite build`; `vite.config.ts`
+  loads the two plugins; `@cloudflare/vite-plugin` reads `wrangler.jsonc` which names
+  the backend entries (`src/index.tsx`, the Durable Object).
+- **Two outputs come out of one build.** The **client bundle** (hashed `canvas-*.js`,
+  `style-*.css`) for browsers, and the **SSR/worker bundle** (`dist/excalidraw_cf/index.js`)
+  for Cloudflare.
+- **The service worker precache is now *generated*.** `sw.js` is produced from
+  `service-worker.template.js` by reading `dist/client/.vite/manifest.json`, so it
+  always caches the real hashed files — never the dev-only `/src/...` source paths.
+
+---
+
 ## 1. Toolchain and package manager
 
 | Concern | Value |

@@ -1,18 +1,15 @@
-// Service worker for offline-first operation.
-// Precaches static assets so the app can boot without a network, then
-// serves the cached shell cache-first. API and WebSocket requests are
-// never cached (they change live state).
+// Generated service worker for offline-first operation.
+// __PRECACHE__ and __CACHE_NAME__ are injected by the build (see the Vite
+// plugin in vite.config.ts) so the service worker always caches the REAL,
+// hashed asset bundle that Vite emits — never the dev-only /src/... source
+// paths. Keeping the precache list correct is the build system's job.
 
-const CACHE = 'excalidraw-cf-v1';
+const CACHE = '__CACHE_NAME__';
 
-// The core app shell. We cache the document, styles, and the main client
-// bundle. In dev/Vite these paths differ; the runtime install step below
-// caches the actual responses we first encounter.
-const PRECACHE = [
-  '/',
-  '/src/style.css',
-  '/src/client/canvas.ts',
-];
+// The core app shell + the real built asset bundle. This list is filled in at
+// build time from vite's .vite/manifest.json, so it stays in lockstep with
+// whatever hashed files the renderer really ships.
+const PRECACHE = __PRECACHE__;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
