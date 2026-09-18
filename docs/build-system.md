@@ -297,22 +297,41 @@ graph TD
 | **SSR rendering** | `src/index.tsx` → `src/renderer.tsx` (`jsxRenderer` + `vite-ssr-components`) |
 | **Client bundle entry** | `src/client/canvas.ts` (from `renderer.tsx` `<Script>`) |
 | **Durable Object entry** | class `DrawingRoom` in `src/do/drawing-room.ts` |
-| **Service worker** | `public/sw.js`, registered from `src/client/offline/service-worker.ts` |
+| **Service worker** | generated `dist/client/sw.js` from `service-worker.template.js`, registered from `src/client/offline/service-worker.ts` |
 
 ---
 
 ## 5. Key couplings / caveats
 
-1. **`worker-configuration.d.ts` is generated, not checked in here.** It only exists
-   after `wrangler types` runs. `src/types/env.ts` (`CloudflareBindings`) is the
-   checked-in manual equivalent used by the Hono generics, so the app type-checks
-   even on a fresh checkout before `cf-typegen`.
+1. **`worker-configuration.d.ts` is generated, not checked in.**
+
+   `wrangler types` (the `cf-typegen` script) *writes* `worker-configuration.d.ts`
+   out of the **current `wrangler.jsonc`** — so it reflects whatever bindings exist
+   in your config *right now*. Several things follow from that:
+
+   - **It's a build/typegen artifact, not source.** It's normally gitignored and
+     regenerated on demand. It is the *compiler-facing* view of the Worker's
+     `Bindings` that TypeScript needs in order to treat `c.env.DRAWING_ROOM` as
+     a real typed namespace.
+   - **`worker-configuration.d.ts` and `src/types/env.ts` are two ways to name the
+     same thing.** `env.ts` spells `CloudflareBindings` by hand; the generated file
+     is the authoritative version produced by `wrangler`. They must stay in step —
+     if you change a binding in `wrangler.jsonc`, you either re-run `cf-typegen`
+     (regenerating the d.ts) or edit `env.ts` by hand. Keeping `env.ts` checked in
+     means the app still type-checks on a fresh checkout *before* anyone runs
+     `cf-typegen`, which is why it's the manual default here.
+
 2. **The `$npm_execpath` recursion is the core "coupled build" trick.** `deploy` and
    `preview` each run a recursive build through the same package manager first.
-3. **The offline precache contract is a real directed edge.** `public/sw.js`
-   hard-codes the *same asset routes* (`/`, `/src/style.css`, `/src/client/canvas.ts`)
-   that `renderer.tsx` emits via `<ViteClient/>`/`<Link>`/`<Script>`. If the renderer's
-   asset paths change, the service-worker precache must change in lockstep.
+
+3. **The offline precache is now *generated*, closing the stale-path bug.** The
+   service worker no longer hard-codes `/src/...` source routes (those don't exist
+   in production, where Vite emits hashed files like `canvas-<hash>.js`). Instead a
+   Vite plugin renders `service-worker.template.js` into `dist/client/sw.js`, filling
+   the precache list from `dist/client/.vite/manifest.json`. So the precache always
+   matches the *real, hashed* assets the renderer ships — no hand-maintained
+   lockstep between `renderer.tsx` and `sw.js` anymore.
+
 4. **Static-host limitation.** Because SSR + Durable Object + WebSocket + API routes
    all run in the Worker, you can extract `dist/` and host it statically, but the
    functional app (rooms, persistence, collaboration, offline sync) will not run
