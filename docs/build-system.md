@@ -332,10 +332,45 @@ graph TD
    matches the *real, hashed* assets the renderer ships — no hand-maintained
    lockstep between `renderer.tsx` and `sw.js` anymore.
 
-4. **Static-host limitation.** Because SSR + Durable Object + WebSocket + API routes
-   all run in the Worker, you can extract `dist/` and host it statically, but the
-   functional app (rooms, persistence, collaboration, offline sync) will not run
-   there. See the README's offline-first section and the parent `ARCHITECTURE.md`.
+4. **"Offline" needs a careful nuance — the app is *mostly* frontend, not all-or-nothing.**
+
+   It is **not** true that "nothing works offline." Once the shell + client bundle
+   are cached, **the whole drawing experience is frontend-only**: the canvas,
+   IndexedDB storage, the outbox queue, and the sync/fork logic in
+   `src/client/offline/*` all run in the browser with no server at all.
+
+   What genuinely *requires* the server is **live collaboration** — the WebSocket.
+   If you're offline (or the Worker is unreachable), you miss **real-time updates
+   from other users** (their new/moved/deleted elements won't arrive), and they
+   won't see yours until you reconnect and the outbox drains. Single-user drawing,
+   loading, saving, and offline-queueing all work fully client-side.
+
+   The real, precise blocker is therefore **reachability of the canvas itself**:
+   the landing and room pages are server-rendered, so getting to `/d/:roomId` at
+   all is the coupling that actually matters — which is exactly the layering the
+   `feat/offline-first` branch was built to solve. See "What next" below.
+
+### What next — making offline *reachable*
+
+The offline layer already handles the *hard part* (edits, IndexedDB, sync, fork).
+The gap is purely that the *route to the canvas* currently comes from the server.
+Options, roughly in increasing effort:
+
+1. **Rely on the service-worker navigation fallback.** `sw.js` already serves the
+   cached `/` shell for *any* navigation request (an SPA-style fallback). Since the
+   client reads the `roomId` straight from `location.pathname` and the offline
+   modules restore from IndexedDB, this can already let a known room open offline —
+   it just needs to be validated and made a first-class path.
+2. **Precache the room route(s).** Add the room page (and the landing page) to the
+   generated precache so `/d/:roomId` is deliberately served from cache even on a
+   cold offline start.
+3. **Prerender the shell from the build** instead of at request time (move the
+   SSR template from `renderer.tsx` into static HTML during `vite build`). This is
+   the bigger architectural move: it removes the server from the *page-delivery*
+   path entirely, leaving the server only for the API + WebSocket that truly need it.
+
+Any of these would let a user "get to canvas" offline — making the layer of
+indirection around `canvas.ts` that `feat/offline-first` added actually reachable.
 
 ---
 
