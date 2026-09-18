@@ -5,6 +5,7 @@ import { updateRemoteCursor, removeRemoteCursor } from './renderer';
 import { enqueue, currentRevision, currentRoomId } from './offline';
 import type { Connectivity } from './offline/connectivity';
 import { isOnline, subscribeConnectivity } from './offline/connectivity';
+import { getStableUserId } from './identity';
 
 class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -18,7 +19,10 @@ class WebSocketClient {
   private cursorThrottle = 0;
 
   constructor() {
-    this.userId = crypto.randomUUID();
+    // Stable per-device identity (localStorage-backed): room attribution and
+    // the "rooms you've edited" registry depend on the SAME userId surviving
+    // reloads. Username stays per-run/cosmetic by design.
+    this.userId = getStableUserId();
     this.username = `User ${Math.floor(Math.random() * 1000)}`;
     // WS lifecycle guardrails: react to connectivity transitions. The
     // subscription is permanent for this singleton; reconnecting is guarded on
@@ -210,7 +214,7 @@ class WebSocketClient {
       if (toSave.length > 0 && this.roomId) {
         fetch(`/api/rooms/${this.roomId}/elements`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-User-Id': this.userId },
           body: JSON.stringify(toSave),
         }).catch(() => {});
       }
@@ -231,7 +235,7 @@ class WebSocketClient {
     if (elements.length > 0) {
       fetch(`/api/rooms/${this.roomId}/elements`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-User-Id': this.userId },
         body: JSON.stringify(elements),
       }).catch(() => {});
     }

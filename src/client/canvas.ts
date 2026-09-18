@@ -10,6 +10,7 @@ import { startConnectivityMonitor } from './offline/connectivity';
 import { registerServiceWorker } from './offline/service-worker';
 import { startRoom, syncIfNeeded } from './offline/sync';
 import { setupOfflineUI } from './offline/offline-ui';
+import { startDrainWorker, setActiveDrainRoom } from './offline/drain';
 
 let canvas: HTMLCanvasElement;
 let animationId: number;
@@ -45,11 +46,18 @@ export function init(): void {
     // attempt network + live sync.
     startRoom(roomId).then(() => {
       wsClient.connect(roomId);
+      // The background drain worker must know which room the main thread owns
+      // (it always skips it — the sync engine alone replays the active room).
+      setActiveDrainRoom(roomId);
       // Ask the sync engine to reconcile once we're connected.
       setTimeout(() => {
         void syncIfNeeded(roomId);
       }, 0);
     });
+    // Background drain: a worker pushes every OTHER known room's outbox to
+    // /api/sync/drain. Only meaningful on a canvas page (the landing page has
+    // no rooms to own), so it is started exactly here, once.
+    startDrainWorker();
     // Periodic auto-save as backup (catches any missed persistence)
     setInterval(() => {
       if (!wsClient.isConnected() && store.elements.size > 0) {

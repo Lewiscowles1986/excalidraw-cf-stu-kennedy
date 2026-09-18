@@ -3,6 +3,8 @@ import type { OfflineOp, OfflineRoom, ServerState, SyncResult } from '../../type
 import { db } from './database';
 import { isOnline, subscribeConnectivity } from './connectivity';
 import { store } from '../state';
+import { applyOpToElements } from './op-apply';
+import { getStableUserId } from '../identity';
 
 /** Temporary debug channel for diagnosing the drain flake. Exposed on window. */
 function dbg(msg: string): void {
@@ -99,20 +101,6 @@ function emptyRoom(roomId: string): OfflineRoom {
   };
 }
 
-function applyOpToElements(elements: ExcalidrawElement[], op: OfflineOp): void {
-  const map = new Map(elements.map(e => [e.id, e]));
-  if (op.type === 'element-update') {
-    for (const el of op.elements) map.set(el.id, el);
-  } else if (op.type === 'element-delete') {
-    for (const id of op.elementIds) {
-      const existing = map.get(id);
-      if (existing) map.set(id, { ...existing, isDeleted: true });
-    }
-  }
-  elements.length = 0;
-  elements.push(...map.values());
-}
-
 /**
  * Attempt to sync the current room. Called on explicit reconnect events and
  * automatically after enqueue when online.
@@ -171,7 +159,7 @@ async function replayOutbox(roomId: string, events: Awaited<ReturnType<typeof db
   const res = await fetch(`/api/rooms/${roomId}/events`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ops: opts, baseRevision }),
+    body: JSON.stringify({ ops: opts, baseRevision, userId: getStableUserId() }),
   });
   const data = await res.json() as ServerState & { ok: boolean; diverged?: boolean; error?: string };
 
@@ -316,11 +304,15 @@ export async function forkRoom(origRoomId: string): Promise<string | null> {
 
   const newRoomId = crypto.randomUUID().substring(0, 8);
 
-  // Seed the new room on the server.
+  // Seed the new room on the server (attributed to this device's userId).
   await fetch(`/api/rooms/${newRoomId}/events`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ops: [{ type: 'element-update', elements }], baseRevision: 0 }),
+    body: JSON.stringify({
+      ops: [{ type: 'element-update', elements }],
+      baseRevision: 0,
+      userId: getStableUserId(),
+    }),
   }).catch(() => {
     // If still offline, the fork is created locally and will sync on reconnect.
   });

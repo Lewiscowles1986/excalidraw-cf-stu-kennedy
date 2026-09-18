@@ -103,17 +103,18 @@ async function readServerElements(page: Page, roomId: string): Promise<unknown[]
 }
 
 // Helper: read every outbox row (op + its autoIncrement seq), oldest first
-// (getAll on a keyPath store returns rows in ascending key order).
-async function readOutboxOps(page: Page): Promise<Array<{ seq: number; op: any }>> {
+// (getAll on a keyPath store returns rows in ascending key order). Rows carry
+// the full EventRow payload written by db.appendEvent.
+async function readOutboxOps(page: Page): Promise<Array<{ seq: number; roomId: string; baseRevision: number; op: any }>> {
   return page.evaluate(() =>
-    new Promise<Array<{ seq: number; op: any }>>((resolve, reject) => {
+    new Promise<Array<{ seq: number; roomId: string; baseRevision: number; op: any }>>((resolve, reject) => {
       const req = indexedDB.open('excalidraw-cf-offline');
       req.onerror = () => reject(req.error);
       req.onsuccess = () => {
         const db = req.result;
         const tx = db.transaction(['events'], 'readonly');
         const getAll = tx.objectStore('events').getAll();
-        getAll.onsuccess = () => resolve(getAll.result as Array<{ seq: number; op: any }>);
+        getAll.onsuccess = () => resolve(getAll.result as Array<{ seq: number; roomId: string; baseRevision: number; op: any }>);
         getAll.onerror = () => reject(getAll.error);
       };
     }),
@@ -175,6 +176,75 @@ async function blockLegacyElementUploads(context: BrowserContext, roomId: string
     }
     return route.continue();
   });
+}
+
+// A minimal-but-valid ExcalidrawElement (shape per src/types/elements.ts) for
+// seeding synthetic outbox ops in tests that never touch the canvas UI.
+function syntheticRectangle(id: string, version = 1): Record<string, unknown> {
+  return {
+    id,
+    type: 'rectangle',
+    x: 40,
+    y: 40,
+    width: 100,
+    height: 60,
+    angle: 0,
+    strokeColor: '#e6edf3',
+    backgroundColor: 'transparent',
+    fillStyle: 'solid',
+    strokeWidth: 2,
+    strokeStyle: 'solid',
+    roughness: 0,
+    opacity: 100,
+    seed: 4242,
+    version,
+    versionNonce: 777,
+    isDeleted: false,
+    groupIds: [],
+    boundElements: null,
+    locked: false,
+    glow: false,
+    cornerRadius: 0,
+  };
+}
+
+// Seed a SECOND room (never opened on the canvas) entirely through raw
+// IndexedDB: a dirty rooms row + one queued events row (seq auto-assigned by
+// the store's key generator, exactly like db.appendEvent does).
+async function seedBackgroundRoom(page: Page, roomId: string, element: Record<string, unknown>): Promise<void> {
+  await page.evaluate(({ roomId, element }) =>
+    new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open('excalidraw-cf-offline');
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction(['rooms', 'events'], 'readwrite');
+        tx.objectStore('rooms').put({
+          roomId,
+          revision: 0,
+          elements: [],
+          lastEditAt: 0,
+          dirty: true,
+          updatedAt: Date.now(),
+        });
+        tx.objectStore('events').add({
+          roomId,
+          op: { type: 'element-update', elements: [element] },
+          baseRevision: 0,
+          createdAt: Date.now(),
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      };
+    }),
+  { roomId, element });
+}
+
+// Outbox row count for ONE room (the global queuedOpCount mixes rooms).
+async function queuedOpCountForRoom(page: Page, roomId: string): Promise<number> {
+  const rows = await readOutboxOps(page);
+  return rows.filter((r) => r.roomId === roomId).length;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -458,4 +528,221 @@ test('connectivity override pins the app online, then releases to navigator.onLi
     window.dispatchEvent(new Event('offline'));
   });
   await expect(page.locator('#offline-banner')).toBeVisible({ timeout: 5_000 });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKGROUND DRAIN (multi-room): a room that is NOT open on the canvas still
+// gets its queued outbox drained — by a dedicated background worker (not the
+// main-thread sync engine, which owns only the active room). Seeded here via
+// raw IndexedDB: rooms row + one events row for 'seed-room-x'.
+//
+// Determinism: the worker is kicked by the SAME main-thread subscription that
+// fires on a connectivity → online transition (goBackOnline); the 30s tick is
+// never relied on. While offline the legacy flushAll() path for the active
+// room is blocked, so the seeded room's ONLY write path is the worker's batch
+// drain. Also the regression guard for the active room: room A must drain
+// exactly once (server elements === drawn count), untouched by the worker.
+// ═══════════════════════════════════════════════════════════════════════════
+test('a background drain worker syncs pending outboxes for rooms that are not open', async ({ page, context }) => {
+  const roomId = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+
+  // The active room drains through the normal main-thread path while online:
+  // leave it clean so any later change in its outbox could only come from a
+  // mis-attributed drain.
+  await drawRectangle(page);
+  await expect.poll(() => queuedOpCount(page), { timeout: 10_000 }).toBe(0);
+  expect((await readServerElements(page, roomId)).length).toBe(1);
+
+  // Guard the scenario: the legacy backup path for the active room is
+  // fulfilled, so PUT /events (replay) is the only real server write.
+  await blockLegacyElementUploads(context, roomId);
+
+  // While OFFLINE, seed a second room entirely via raw IndexedDB. The room id
+  // gets a per-run suffix because DO state survives across suite runs against
+  // the same dev server — a fixed id would already be drained (revision ≥ 1)
+  // by the second run and diverge instead of syncing.
+  await goOffline(context, page);
+  await expect(page.locator('#offline-banner')).toBeVisible();
+  const seededId = `seed-room-x-${Date.now().toString(36)}`;
+  const seededElementId = 'seed-el-background-1';
+  await seedBackgroundRoom(page, seededId, syntheticRectangle(seededElementId));
+  expect(await queuedOpCountForRoom(page, seededId)).toBe(1);
+
+  // Reconnect: the online transition kicks the background drain worker. The
+  // seeded room is NOT the active room, so only the worker can sync it.
+  await goBackOnline(context, page);
+
+  // The seeded room's op reaches the server (the core guarantee).
+  await expect
+    .poll(async () => (await readServerElements(page, seededId)).length, { timeout: 15_000 })
+    .toBe(1);
+  // ... and its outbox drains (exactly-once: no duplicate delivery).
+  await expect
+    .poll(() => queuedOpCountForRoom(page, seededId), { timeout: 15_000 })
+    .toBe(0);
+  const seededServer = (await readServerElements(page, seededId)) as Array<{ id: string }>;
+  expect(seededServer.map((e) => e.id)).toEqual([seededElementId]);
+
+  // Active room is unaffected: server elements exactly the drawn count, and
+  // its own outbox still empty (the worker must have skipped it).
+  const activeServer = (await readServerElements(page, roomId)) as Array<{ id: string }>;
+  expect(activeServer.length).toBe(1);
+  expect(await queuedOpCountForRoom(page, roomId)).toBe(0);
+
+  // The background room's local snapshot was reconciled too.
+  const seededLocal = await readLocalRoom(page, seededId);
+  expect(seededLocal, 'seeded room snapshot should exist locally').toBeTruthy();
+  expect(seededLocal.dirty).toBe(false);
+  expect(seededLocal.revision).toBe(1);
+  const seededLocalIds: string[] = (seededLocal.elements ?? []).map((e: any) => e.id);
+  expect(seededLocalIds).toContain(seededElementId);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DRAIN ENDPOINT (no worker): POST /api/sync/drain must forward each room's
+// ops to its DO with the optimistic revision check intact — a stale
+// baseRevision comes back as a per-room "diverged" entry WITHOUT applying the
+// ops, a fresh baseRevision applies and bumps the revision. Also guards the
+// documented 20-room batch cap.
+// ═══════════════════════════════════════════════════════════════════════════
+test('the drain endpoint reports divergence per room without applying ops', async ({ page }) => {
+  const roomId = await loadOnline(page);
+
+  // One element already synced online: the server revision is now 1.
+  await drawRectangle(page);
+  await expect.poll(() => queuedOpCount(page), { timeout: 10_000 }).toBe(0);
+  expect((await readServerElements(page, roomId)).length).toBe(1);
+
+  // Stale baseRevision → per-room diverged entry, ops NOT applied.
+  const stale = await page.request.post('/api/sync/drain', {
+    data: {
+      rooms: [{
+        roomId,
+        ops: [{ type: 'element-update', elements: [syntheticRectangle('drain-endpoint-el')] }],
+        baseRevision: 999,
+      }],
+    },
+  });
+  expect(stale.status()).toBe(200);
+  const staleBody = await stale.json();
+  expect(staleBody.results).toHaveLength(1);
+  expect(staleBody.results[0].roomId).toBe(roomId);
+  expect(staleBody.results[0].diverged).toBe(true);
+  expect(staleBody.results[0].ok).toBeFalsy();
+  // The op was NOT applied — the server still holds exactly the drawn element.
+  expect((await readServerElements(page, roomId)).length).toBe(1);
+
+  // Correct baseRevision (fresh from /state): the batch applies cleanly.
+  // (The initial draw may legitimately bump the server twice — the WS frame
+  // and the outbox replay upsert the same element — so only the DELTA from
+  // the fetched state is asserted here.)
+  const stateRes = await page.request.get(`/api/rooms/${roomId}/state`);
+  const state = await stateRes.json();
+  expect(state.revision).toBeGreaterThan(0);
+  const fresh = await page.request.post('/api/sync/drain', {
+    data: {
+      rooms: [{
+        roomId,
+        ops: [{ type: 'element-update', elements: [syntheticRectangle('drain-endpoint-el')] }],
+        baseRevision: state.revision,
+      }],
+    },
+  });
+  expect(fresh.status()).toBe(200);
+  const freshBody = await fresh.json();
+  expect(freshBody.results[0].roomId).toBe(roomId);
+  expect(freshBody.results[0].ok).toBe(true);
+  expect(freshBody.results[0].diverged).toBeFalsy();
+  expect(freshBody.results[0].revision).toBe(state.revision + 1);
+  const elements = (await readServerElements(page, roomId)) as Array<{ id: string }>;
+  expect(elements.length).toBe(2);
+  expect(elements.map((e) => e.id)).toContain('drain-endpoint-el');
+
+  // Batches above the documented cap (20 rooms) are rejected outright.
+  const tooMany = await page.request.post('/api/sync/drain', {
+    data: {
+      rooms: Array.from({ length: 21 }, (_, i) => ({
+        roomId: `cap-room-${i}`,
+        ops: [],
+        baseRevision: 0,
+      })),
+    },
+  });
+  expect(tooMany.status()).toBe(400);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKGROUND DRAIN — DIVERGENCE: if a background room moved on the server
+// ahead of the worker's baseRevision, the batch drain reports diverged for
+// that room only, the worker surfaces a warning sync-status event, the queued
+// events are KEPT (nothing lost, nothing silently merged), and the server
+// state is left untouched.
+// ═══════════════════════════════════════════════════════════════════════════
+test('a background room that diverged keeps its outbox and warns via sync-status', async ({ page, context }) => {
+  const roomId = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+
+  // Keep the active room clean; block its legacy backup path for the whole
+  // scenario so PUT /events is the only real server write path.
+  await drawRectangle(page);
+  await expect.poll(() => queuedOpCount(page), { timeout: 10_000 }).toBe(0);
+  await blockLegacyElementUploads(context, roomId);
+
+  // Collect the warning the worker's diverged report must produce.
+  await page.evaluate(() => {
+    (window as any).__drainWarnings = [] as Array<{ roomId: string; message: string }>;
+    window.addEventListener('excalidraw:sync-status', ((e: CustomEvent) => {
+      if (e.detail?.kind === 'warning') {
+        (window as any).__drainWarnings.push({ roomId: e.detail.roomId, message: e.detail.message });
+      }
+    }) as EventListener);
+  });
+
+  // Seed a background room whose outbox op carries a STALE baseRevision: the
+  // server is pre-loaded with one element first (revision 1) while the seeded
+  // snapshot still claims revision 0.
+  const divergedRoomId = `seed-room-div-${Date.now().toString(36)}`;
+  const divergedElementId = 'seed-el-divergent-1';
+  const pre = await page.request.post('/api/sync/drain', {
+    data: {
+      rooms: [{
+        roomId: divergedRoomId,
+        ops: [{ type: 'element-update', elements: [syntheticRectangle('seed-el-server-1')] }],
+        baseRevision: 0,
+      }],
+    },
+  });
+  expect(pre.status()).toBe(200);
+  expect((await pre.json()).results[0].ok).toBe(true);
+
+  await goOffline(context, page);
+  await expect(page.locator('#offline-banner')).toBeVisible();
+  // Seeded AFTER the server pre-load, so its revision-0 base is already stale.
+  await seedBackgroundRoom(page, divergedRoomId, syntheticRectangle(divergedElementId));
+  expect(await queuedOpCountForRoom(page, divergedRoomId)).toBe(1);
+
+  // Reconnect → kick → the worker drains and hits the divergence.
+  await goBackOnline(context, page);
+
+  // The worker reports the conflict through the standard status channel.
+  await expect
+    .poll(
+      () => page.evaluate((rid: string) => ((window as any).__drainWarnings || []).some(
+        (w: any) => w.roomId === rid && /conflict/i.test(w.message),
+      ), divergedRoomId),
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+
+  // Nothing was lost and nothing was merged: the outbox is intact, the local
+  // snapshot is flagged dirty, and the server was NOT given the stale ops.
+  await expect
+    .poll(() => queuedOpCountForRoom(page, divergedRoomId), { timeout: 5_000 })
+    .toBe(1);
+  const local = await readLocalRoom(page, divergedRoomId);
+  expect(local, 'diverged room snapshot should exist locally').toBeTruthy();
+  expect(local.dirty).toBe(true);
+  const server = (await readServerElements(page, divergedRoomId)) as Array<{ id: string }>;
+  expect(server.map((e) => e.id)).toEqual(['seed-el-server-1']);
 });
