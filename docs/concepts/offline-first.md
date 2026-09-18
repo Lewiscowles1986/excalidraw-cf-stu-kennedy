@@ -37,8 +37,8 @@ online collaborators see them.
 ### Where in the code?
 
 - `src/client/offline/` — a whole folder of client-side logic:
-  - `connectivity.ts` — the app's "am I online?" check (and it's *pessimistic*:
-    it assumes offline until proven otherwise).
+  - `connectivity.ts` — the app's "am I online?" check (it trusts the
+    browser: `navigator.onLine` and the `online`/`offline` events decide).
   - `database.ts` — the in-browser storage (IndexedDB) + the queued outbox.
   - `sync.ts` — the "sync now that I'm back" engine.
   - `service-worker.ts` — registers the service worker that pre-caches the app.
