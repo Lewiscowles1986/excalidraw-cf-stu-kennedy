@@ -275,7 +275,7 @@ graph TD
     RT -- "proxies /api/ping | state | events | elements" --> DO
     RT -- "uses sse-helpers" --> HELPER
     WSCL -- "ws:///ws/:roomId" --> IDX
-    OFFLINE -- "GET /api/ping; PUT /api/rooms/:id/events" --> RT
+    OFFLINE -- "HTTP replay PUT /api/rooms/:id/events (baseRevision); navigator.onLine connectivity" --> RT
     OFFLINE -- "sync reconcile" --> DO
 
     %% ── Playwright webServer ──────────────────────────
