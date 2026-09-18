@@ -191,7 +191,96 @@ moving on to `vite preview` / `wrangler deploy`.
 
 ## 3. The coupled build graph
 
-A validated visual of the whole system is in **[Section 0 — The build graph](#0-the-build-graph-at-a-glance)** above. The graph there is the canonical view; the node tables in this section give the exact names and roles behind each node.
+This is the fuller **coupling-focused** view. It differs from **Section 0** like this:
+
+- **Section 0** is the *lean, output-oriented* view — "what the build emits," with the
+  now-generated service-worker precache highlighted.
+- **Section 3** is the *coupling-oriented* view — "how everything talks to
+  everything." The important extra it captures is the **`$npm_execpath` recursive
+  build**: `deploy`/`preview` first re-invoke the package manager to build, *then*
+  hand off to wrangler / `vite preview`. That self-reference is the core reason
+  this build is called "coupled," and it is only visible here.
+
+> Parse note: Mermaid chokes on `$` inside a quoted edge label (`got 'STR'`).
+> The graph below keeps `$` only inside **node** definitions (which render fine)
+> and avoids it in **edge** labels.
+
+```mermaid
+graph TD
+    %% ── Manifests & config ─────────────────────────────
+    PKG["package.json<br/><i>scripts + deps</i>"]
+    EXEC["$npm_execpath<br/><i>npm | bun CLI</i>"]
+    VITE["vite<br/><i>bundler / dev server</i>"]
+    CFP["@cloudflare/vite-plugin"]
+    SSR["vite-ssr-components"]
+    WRG["wrangler CLI"]
+    WRGC["wrangler.jsonc"]
+    SCHEMA["config-schema.json<br/><i>in node_modules</i>"]
+    TS["tsconfig.json<br/><i>types: vite/client,<br/>@cloudflare/workers-types</i>"]
+    PW["@playwright/test"]
+
+    %% ── Worker app entry points ──────────────────────
+    IDX["src/index.tsx<br/><i>Hono Worker entry</i>"]
+    RDR["src/renderer.tsx<br/><i>jsxRenderer SSR shell</i>"]
+    RT["src/routes/*<br/>drawing / api / sse"]
+    HELPER["src/lib/sse-helpers.ts"]
+    DO["src/do/drawing-room.ts<br/><i>Durable Object</i>"]
+    ENV["src/types/env.ts<br/>CloudflareBindings"]
+
+    %% ── Client bundle ─────────────────────────────────
+    CANVAS["src/client/canvas.ts<br/><i>client bundle entry</i>"]
+    OFFLINE["src/client/offline/*<br/>connectivity, db, sync,<br/>offline-ui, sw-reg"]
+    WSCL["src/client/ws-client.ts"]
+    STYLE["src/style.css"]
+    SW["public/sw.js<br/><i>service worker</i>"]
+
+    %% ── Scripts → tools (the recursive-build coupling) ──
+    PKG -. dev .-> VITE
+    PKG -. build .-> VITE
+    PKG -. deploy .-> EXEC
+    PKG -. preview .-> EXEC
+    PKG -. cf-typegen .-> WRG
+    PKG -. test / test:ui .-> PW
+    EXEC -. "recursive run build first" .-> VITE
+    EXEC -. "then" .-> WRG
+
+    %% ── Vite config wires plugins ─────────────────────
+    VITE -- "plugin" --> CFP
+    VITE -- "plugin" --> SSR
+    CFP -- "hosts Worker as dev server;<br/>reads config + emits bundle" --> WRGC
+
+    %% ── Wrangler config ──────────────────────────────
+    WRG -- "reads" --> WRGC
+    WRGC -- "references schema" --> SCHEMA
+    WRGC -- "main = ./src/index.tsx" --> IDX
+    WRGC -- "binding DRAWING_ROOM + migration" --> DO
+    WRG -- "generates" --> WCG["worker-configuration.d.ts"]
+    WCG -- "type-checks against" --> TS
+    ENV -- "Hono generics" --> IDX
+
+    %% ── SSR ↔ client bundle ────────────────────────────
+    IDX -- "app.use(renderer)" --> RDR
+    RDR -- "ViteClient / Link / Script" --> SSR
+    RDR -- "Script src=/src/client/canvas.ts" --> CANVAS
+    RDR -- "Link href=/src/style.css" --> STYLE
+    CANVAS -- "imports" --> OFFLINE
+    CANVAS -- "imports" --> WSCL
+    OFFLINE -- "registers" --> SW
+    SW -- "precaches" --> STYLE
+    SW -- "precaches" --> CANVAS
+
+    %% ── Routes / DO / WS ─────────────────────────────
+    IDX -- "mounts" --> RT
+    IDX -- "ws/:roomId upgrade" --> DO
+    RT -- "proxies /api/ping | state | events | elements" --> DO
+    RT -- "uses sse-helpers" --> HELPER
+    WSCL -- "ws:///ws/:roomId" --> IDX
+    OFFLINE -- "GET /api/ping; PUT /api/rooms/:id/events" --> RT
+    OFFLINE -- "sync reconcile" --> DO
+
+    %% ── Playwright webServer ──────────────────────────
+    PW -- "boots dev server on port 5199" --> PKG
+```
 
 ---
 
