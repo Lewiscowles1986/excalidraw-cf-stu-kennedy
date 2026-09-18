@@ -7,16 +7,37 @@ import { resolve } from 'node:path'
 const rootDir = import.meta.dirname ?? process.cwd()
 
 /**
- * Generates the service worker's precache list from vite's manifest at build
- * time. The service worker must cache the REAL hashed bundle files (e.g.
- * assets/canvas-C9aAP8h2.js), NOT dev-only /src/... source paths. This plugin
- * renders service-worker.template.js with the correct cache name + asset list
- * and writes dist/client/sw.js, so the build keeps the precache correct.
+ * Generates the service worker's precache list so it is always correct for the
+ * current mode:
+ *   - dev  : precaches the vite dev URLs (`/`, `/src/style.css`, `/src/client/canvas.ts`),
+ *            which ARE the real URLs served by the dev server.
+ *   - build: precaches the REAL hashed bundle files (e.g. assets/canvas-C9aAP8h2.js)
+ *            read from dist/client/.vite/manifest.json.
+ * Produces the SW at public/sw.js (dev) or dist/client/sw.js (build); neither is
+ * committed — both are generated so the service worker can never drift from the
+ * assets the renderer actually ships.
  */
 function serviceWorkerPlugin(): Plugin {
+  function renderTemplate(assets: Set<string>): string {
+    const cacheName = `excalidraw-cf-${Date.now()}`
+    const precacheList = JSON.stringify(Array.from(assets))
+    const template = readFileSync(resolve(rootDir, 'service-worker.template.js'), 'utf-8')
+    return template.replaceAll('__CACHE_NAME__', cacheName).replaceAll('__PRECACHE__', precacheList)
+  }
+
   return {
     name: 'excalidraw-cf-service-worker',
-    apply: 'build',
+    configureServer(server) {
+      // Dev: write a generated sw.js into public/ so /sw.js is served while
+      // developing. The dev asset paths are the real ones Vite serves.
+      const devAssets = new Set<string>(['/', '/src/style.css', '/src/client/canvas.ts'])
+      writeFileSync(resolve(rootDir, 'public/sw.js'), renderTemplate(devAssets))
+      server.watcher.on('change', (file) => {
+        if (String(file).endsWith('service-worker.template.js')) {
+          writeFileSync(resolve(rootDir, 'public/sw.js'), renderTemplate(devAssets))
+        }
+      })
+    },
     closeBundle() {
       const clientDir = resolve(rootDir, 'dist/client')
       const manifestPath = resolve(clientDir, '.vite/manifest.json')
@@ -39,15 +60,8 @@ function serviceWorkerPlugin(): Plugin {
         }
       }
 
-      const template = readFileSync(resolve(rootDir, 'service-worker.template.js'), 'utf-8')
-      const cacheName = `excalidraw-cf-${Date.now()}`
-      const precacheList = JSON.stringify(Array.from(assets))
-      const source = template
-        .replaceAll('__CACHE_NAME__', cacheName)
-        .replaceAll('__PRECACHE__', precacheList)
-
       mkdirSync(clientDir, { recursive: true })
-      writeFileSync(resolve(clientDir, 'sw.js'), source)
+      writeFileSync(resolve(clientDir, 'sw.js'), renderTemplate(assets))
     },
   }
 }
