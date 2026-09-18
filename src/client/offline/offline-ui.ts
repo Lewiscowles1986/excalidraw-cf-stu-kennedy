@@ -1,4 +1,5 @@
 import { answerFork } from './sync';
+import { isOnline } from './connectivity';
 
 // Lightweight DOM-driven offline status banner + fork prompt.
 // These listen to the custom events the sync engine dispatches, so the
@@ -8,9 +9,9 @@ export function setupOfflineUI(): void {
   const banner = document.createElement('div');
   banner.id = 'offline-banner';
   banner.className = 'offline-banner';
-  // Default connectivity is offline, so show the banner immediately. The
-  // connectivity listener will hide it the moment a probe succeeds.
-  banner.style.display = 'block';
+  // Initialize the banner from the current connectivity state (navigator.onLine
+  // at boot); the listeners below keep it in sync with transitions.
+  banner.style.display = isOnline() ? 'none' : 'block';
   banner.textContent = 'Offline — edits are stored locally';
   document.body.appendChild(banner);
 
@@ -73,8 +74,8 @@ export function setupOfflineUI(): void {
   }) as EventListener);
 }
 
-// Drive the banner directly from connectivity (covers the default-offline boot,
-// where the sync engine has nothing to emit yet).
+// Drive the banner directly from connectivity (covers the boot state, where
+// the sync engine has nothing to emit yet).
 function connectivityBannerListener(banner: HTMLElement): void {
   window.addEventListener('excalidraw:connectivity', ((e: CustomEvent) => {
     const online = !!e.detail.online;

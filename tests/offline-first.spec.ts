@@ -90,10 +90,91 @@ async function queuedOpCount(page: Page): Promise<number> {
   );
 }
 
+// TEMP DIAGNOSTIC: dump the sync engine's __dbg log.
+async function dumpDbg(page: Page): Promise<void> {
+  const log = await page.evaluate(() => ((window as any).__dbg || []).join('\n'));
+  console.log('=== __dbg ===\n' + log + '\n==============');
+}
+
 // Helper: read the room's elements from the server.
 async function readServerElements(page: Page, roomId: string): Promise<unknown[]> {
   const res = await page.request.get(`/api/rooms/${roomId}/elements`);
   return res.ok() ? (res.json() as Promise<unknown[]>) : [];
+}
+
+// Helper: read every outbox row (op + its autoIncrement seq), oldest first
+// (getAll on a keyPath store returns rows in ascending key order).
+async function readOutboxOps(page: Page): Promise<Array<{ seq: number; op: any }>> {
+  return page.evaluate(() =>
+    new Promise<Array<{ seq: number; op: any }>>((resolve, reject) => {
+      const req = indexedDB.open('excalidraw-cf-offline');
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction(['events'], 'readonly');
+        const getAll = tx.objectStore('events').getAll();
+        getAll.onsuccess = () => resolve(getAll.result as Array<{ seq: number; op: any }>);
+        getAll.onerror = () => reject(getAll.error);
+      };
+    }),
+  );
+}
+
+// Helper: read the locally cached room snapshot (rooms object store).
+async function readLocalRoom(page: Page, roomId: string): Promise<any> {
+  return page.evaluate((roomId: string) =>
+    new Promise<any>((resolve, reject) => {
+      const req = indexedDB.open('excalidraw-cf-offline');
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction(['rooms'], 'readonly');
+        const get = tx.objectStore('rooms').get(roomId);
+        get.onsuccess = () => resolve(get.result ?? null);
+        get.onerror = () => reject(get.error);
+      };
+    }),
+  roomId,
+  );
+}
+
+// Element ids referenced by a list of outbox rows (updates carry elements,
+// deletes carry ids).
+function opElementIds(rows: Array<{ op: any }>): string[] {
+  return rows.flatMap((r) =>
+    r.op.type === 'element-update' ? r.op.elements.map((e: any) => e.id) : r.op.elementIds,
+  );
+}
+
+// Step 7 helper: restore connectivity and nudge the sync engine. Same nudge
+// the drain test performs inline, extracted so every reconnect scenario is
+// byte-for-byte identical.
+async function goBackOnline(context: BrowserContext, page: Page): Promise<void> {
+  await context.setOffline(false);
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('offline'));
+    window.dispatchEvent(new Event('online'));
+    // Tell the app's connectivity monitor directly too, so we aren't waiting on
+    // a /api/ping round-trip before sync begins.
+    window.dispatchEvent(new CustomEvent('excalidraw:connectivity', { detail: { online: true } }));
+  });
+}
+
+// Fulfil the legacy periodic-backup writes (flushAll → PUT /elements) so the
+// outbox replay (PUT /events) is the ONLY server write path in a scenario.
+// Without this, a 3s interval tick landing between reconnect and WS-open could
+// upload the store behind the test's back and turn a conflict benign.
+async function blockLegacyElementUploads(context: BrowserContext, roomId: string): Promise<void> {
+  await context.route(`**/api/rooms/${roomId}/elements`, (route) => {
+    if (route.request().method() === 'PUT') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true }),
+      });
+    }
+    return route.continue();
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +229,12 @@ test('queued offline edits drain to the server once back online', async ({ page,
   await page.evaluate(() => {
     window.dispatchEvent(new Event('offline'));
     window.dispatchEvent(new Event('online'));
+    // Tell the app's connectivity monitor directly too, so we aren't waiting on
+    // a /api/ping round-trip before sync begins.
+    window.dispatchEvent(new CustomEvent('excalidraw:connectivity', { detail: { online: true } }));
   });
+  // Wait until the app actually believes it is online before polling the outbox.
+  await expect(page.locator('#offline-banner')).toBeHidden({ timeout: 15_000 });
   // Server eventually receives the queued element (the core guarantee).
   await expect
     .poll(
@@ -156,9 +242,8 @@ test('queued offline edits drain to the server once back online', async ({ page,
       { timeout: 15_000 },
     )
     .toBeGreaterThan(0);
-  // The local outbox drains too. Best-effort: the sync engine clears it in the
-  // same pass, but we keep this as a lenient check since it's an internal
-  // implementation detail; server delivery above is the hard guarantee.
+  // The local outbox drains too (all synced edits cleared).
+  await dumpDbg(page);
   await expect
     .poll(() => queuedOpCount(page), { timeout: 15_000 })
     .toBe(0);
@@ -183,4 +268,194 @@ test.skip('the canvas page itself stays reachable offline via the cached shell',
   // still offline (SW shell did not hit the network)
   await expect(page.locator('#offline-banner')).toBeVisible();
   expect(page.url()).toMatch(/\/d\//);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MULTI-OP DRAIN: several queued ops must coexist in the outbox and replay in
+// order. This permanently guards the IndexedDB appendEvent autoIncrement fix
+// (with the old explicit-key bug the SECOND enqueue threw ConstraintError, so
+// any 2+-events-per-room flow silently broke) and the ordered HTTP replay.
+// ═══════════════════════════════════════════════════════════════════════════
+test('several offline ops (draw, erase, draw) drain fully and in order', async ({ page, context }) => {
+  // 1–5. online, SW ready, then offline
+  const roomId = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+  await blockLegacyElementUploads(context, roomId);
+  await goOffline(context, page);
+  await expect(page.locator('#offline-banner')).toBeVisible();
+
+  // 6. three offline mutations: draw rect A, erase it, draw rect B.
+  await drawRectangle(page);
+  await page.waitForTimeout(600);
+  await page.click('[title*="Eraser"]');
+  const canvas = page.locator('#excalidraw-canvas');
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error('canvas has no bounding box');
+  // Rect A spans centre→centre+120/+90. The default rectangle is stroke-only
+  // (transparent fill), so hit-testing only registers near its EDGES (±10px):
+  // click on its top edge, away from rect B's future footprint overlap.
+  await page.mouse.click(box.x + box.width / 2 + 30, box.y + box.height / 2 + 3);
+  await page.waitForTimeout(600);
+  await drawRectangle(page);
+  await page.waitForTimeout(600);
+
+  // All three ops coexist in the outbox, in interaction order, and the delete
+  // targets the element the first op created (ordering is preserved).
+  const ops = await readOutboxOps(page);
+  expect(ops.map((r) => r.op.type)).toEqual(['element-update', 'element-delete', 'element-update']);
+  expect(ops[0].op.elements[0].id).toBe(ops[1].op.elementIds[0]);
+  const erasedId = ops[1].op.elementIds[0];
+  const keptId = ops[2].op.elements[0].id;
+
+  // 7. reconnect: the whole outbox must replay to the server.
+  await goBackOnline(context, page);
+  await expect(page.locator('#offline-banner')).toBeHidden({ timeout: 15_000 });
+  // The erased element is gone server-side; the last-drawn element made it.
+  await expect
+    .poll(
+      async () => {
+        const els = (await readServerElements(page, roomId)) as Array<{ id: string }>;
+        return els.length === 1 && els[0].id === keptId && !els.some((e) => e.id === erasedId);
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  // And the local outbox is empty again.
+  await expect.poll(() => queuedOpCount(page), { timeout: 15_000 }).toBe(0);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFLICT / DIVERGENCE: while browser A is offline, browser B (same room,
+// isolated context) keeps editing live, bumping the server revision. A's
+// replay then carries a stale baseRevision and the server replies diverged.
+// The app must not silently lose either side: A gets a fork prompt, A's local
+// outbox + snapshot stay intact, and the server state is left untouched.
+// ═══════════════════════════════════════════════════════════════════════════
+test('diverged replay after a server-side edit keeps local data and offers a fork', async ({ browser }) => {
+  // Browser A: fresh room, one element drawn (and synced) while online.
+  const aContext = await browser.newContext();
+  const aPage = await aContext.newPage();
+  const roomId = await loadOnline(aPage);
+  await ensureServiceWorkerReady(aPage);
+  await blockLegacyElementUploads(aContext, roomId);
+  await drawRectangle(aPage);
+  await aPage.waitForTimeout(600);
+  // The online edit syncs immediately; wait for the outbox to settle so the
+  // engine's baseRevision is the real server revision before A goes offline.
+  await expect.poll(() => queuedOpCount(aPage), { timeout: 10_000 }).toBe(0);
+
+  // A goes offline and queues a second element (never sent, never seen).
+  await goOffline(aContext, aPage);
+  await expect(aPage.locator('#offline-banner')).toBeVisible();
+  await drawRectangle(aPage);
+  await aPage.waitForTimeout(700);
+  const outboxBefore = await queuedOpCount(aPage);
+  expect(outboxBefore).toBe(1);
+  const aOps = await readOutboxOps(aPage);
+  const aOfflineIds = opElementIds(aOps);
+  // The queued op was built on the revision A last saw (non-zero after the
+  // online draw synced) — this is the base that is about to go stale.
+  expect(aOps[0].baseRevision).toBeGreaterThan(0);
+
+  // Browser B (separate context ⇒ isolated IndexedDB) joins the same room
+  // while online and draws over the live WebSocket, bumping the revision.
+  const bContext = await browser.newContext();
+  const bPage = await bContext.newPage();
+  await bPage.goto(`/d/${roomId}`);
+  await bPage.waitForSelector('#excalidraw-canvas');
+  await drawRectangle(bPage);
+  await bPage.waitForTimeout(800);
+  // The server now holds A's online element + B's element — exactly two.
+  await expect
+    .poll(async () => (await readServerElements(aPage, roomId)).length, { timeout: 10_000 })
+    .toBe(2);
+
+  // A reconnects: the replay carries the stale base → diverged.
+  await goBackOnline(aContext, aPage);
+
+  // Data-loss guardrail: the fork prompt appears instead of a silent merge.
+  await expect(aPage.locator('#fork-modal')).toBeVisible({ timeout: 15_000 });
+
+  // The diverged replay must not have touched the server: still exactly the
+  // two live elements, and A's offline element is still absent.
+  const serverAfter = (await readServerElements(aPage, roomId)) as Array<{ id: string }>;
+  expect(serverAfter.length).toBe(2);
+  for (const id of aOfflineIds) expect(serverAfter.map((e) => e.id)).not.toContain(id);
+
+  // Declining the fork keeps local data: outbox intact, snapshot intact.
+  await aPage.click('[data-fork-cancel]');
+  await expect(aPage.locator('#fork-modal')).toBeHidden();
+  await expect(aPage.locator('#offline-banner')).toBeVisible();
+  expect(await queuedOpCount(aPage)).toBe(outboxBefore);
+  const local = await readLocalRoom(aPage, roomId);
+  expect(local, 'local room snapshot should survive the divergence').toBeTruthy();
+  const localIds: string[] = (local.elements ?? []).map((e: any) => e.id);
+  for (const id of aOfflineIds) expect(localIds).toContain(id);
+
+  await aContext.close();
+  await bContext.close();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RELOAD PERSISTENCE (offline): the SW-served shell currently lands on the
+// landing page (nav-fallback for /d/:id is not implemented — see the skipped
+// test above), so the canvas itself cannot be asserted here. What MUST hold
+// is data safety: the outbox rows and the dirty room snapshot survive the
+// reload untouched, so nothing queued can ever be lost by a refresh.
+// ═══════════════════════════════════════════════════════════════════════════
+test('offline outbox rows and room snapshot survive a page reload', async ({ page, context }) => {
+  // 1–5. online, SW ready, then offline
+  const roomId = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+  await goOffline(context, page);
+  await expect(page.locator('#offline-banner')).toBeVisible();
+
+  // 6. draw while offline; exactly one queued op.
+  await drawRectangle(page);
+  await page.waitForTimeout(700);
+  const before = await readOutboxOps(page);
+  expect(before.length).toBe(1);
+
+  // 7. reload while still offline — IndexedDB is per-origin and must persist.
+  await page.reload({ waitUntil: 'domcontentloaded' });
+
+  // Outbox survived the reload with the very same row (seq preserved).
+  await expect.poll(async () => (await readOutboxOps(page)).length, { timeout: 10_000 }).toBe(1);
+  const after = await readOutboxOps(page);
+  expect(after[0].seq).toBe(before[0].seq);
+  // The dirty room snapshot survived too, still holding the drawn element.
+  const local = await readLocalRoom(page, roomId);
+  expect(local, 'room snapshot should persist across reload').toBeTruthy();
+  expect(local.dirty).toBe(true);
+  const localIds: string[] = (local.elements ?? []).map((e: any) => e.id);
+  expect(localIds).toContain(before[0].op.elements[0].id);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONNECTIVITY OVERRIDE: the DEV/test pin (window.__connectivityOverride boot
+// hook) must win over the machine's REAL connectivity, and removing it must
+// hand control back to navigator.onLine on the next transition.
+// ═══════════════════════════════════════════════════════════════════════════
+test('connectivity override pins the app online, then releases to navigator.onLine', async ({ page, context }) => {
+  // Pin "online" before boot (the app is genuinely online at this point).
+  await page.addInitScript(() => {
+    (window as any).__connectivityOverride = 'online';
+  });
+  await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+  await expect(page.locator('#offline-banner')).toBeHidden();
+
+  // Cut the network for real (navigator.onLine=false): the pin must win, so
+  // no offline banner may appear.
+  await goOffline(context, page);
+  await expect(page.locator('#offline-banner')).toBeHidden({ timeout: 5_000 });
+
+  // Release the pin: the boot hook is re-read on every connectivity
+  // transition, so deleting the window property re-evaluates navigator.onLine
+  // (false here) and flips the app offline.
+  await page.evaluate(() => {
+    delete (window as any).__connectivityOverride;
+    window.dispatchEvent(new Event('offline'));
+  });
+  await expect(page.locator('#offline-banner')).toBeVisible({ timeout: 5_000 });
 });

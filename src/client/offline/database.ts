@@ -103,7 +103,9 @@ export const db = {
 
   /** Append an offline op to a room's log. Returns the new seq. */
   async appendEvent(roomId: string, op: OfflineOp, baseRevision: number): Promise<number> {
-    const row: EventRow = { roomId, op, baseRevision, createdAt: Date.now(), seq: 0 };
+    // Omit `seq` so the store's autoIncrement key generator assigns it. Writing
+    // an explicit key (e.g. 0) makes the second add() throw ConstraintError.
+    const row = { roomId, op, baseRevision, createdAt: Date.now() };
     const putReq = tx<number>(EVENTS, 'readwrite', (s) => s.add(row) as IDBRequest<number>);
     // add resolves to the generated key
     return putReq.then((k) => k as number);
@@ -111,24 +113,13 @@ export const db = {
 
   /** Load every queued event for a room, oldest first. */
   async getEvents(roomId: string): Promise<EventRow[]> {
-    const rows = await tx<EventRow[]>(EVENTS, 'readonly', (s) => {
-      const idx = s.index('roomId');
-      const range = IDBKeyRange.only(roomId);
-      const req = idx.openCursor(range);
-      return new Promise((resolve, reject) => {
-        const out: EventRow[] = [];
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (cursor) {
-            out.push(cursor.value);
-            cursor.continue();
-          } else {
-            resolve(out);
-          }
-        };
-        req.onerror = () => reject(req.error);
-      });
-    });
+    // getAll() on the roomId index returns a real IDBRequest, which tx() handles
+    // correctly. (The previous cursor-loop version returned a Promise, which tx()
+    // silently mishandled — it set .onsuccess on the Promise — so getEvents()
+    // always resolved [] and the outbox never drained.)
+    const rows = await tx<EventRow[]>(EVENTS, 'readonly', (s) =>
+      s.index('roomId').getAll(IDBKeyRange.only(roomId)) as IDBRequest<EventRow[]>,
+    );
     return rows.sort((a, b) => a.seq - b.seq);
   },
 
@@ -148,13 +139,9 @@ export const db = {
 
   /** List all known room ids. */
   async listRooms(): Promise<string[]> {
-    const rows = await tx<{ roomId: string }[]>(ROOMS, 'readonly', (s) => {
-      const req = s.getAll();
-      return new Promise((resolve, reject) => {
-        req.onsuccess = () => resolve(req.result as { roomId: string }[]);
-        req.onerror = () => reject(req.error);
-      });
-    });
+    const rows = await tx<{ roomId: string }[]>(ROOMS, 'readonly', (s) =>
+      s.getAll() as IDBRequest<{ roomId: string }[]>,
+    );
     return rows.map(r => r.roomId);
   },
 };

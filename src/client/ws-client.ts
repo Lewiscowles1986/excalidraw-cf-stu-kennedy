@@ -3,7 +3,8 @@ import type { ClientMessage, ServerMessage } from '../types/protocol';
 import { store } from './state';
 import { updateRemoteCursor, removeRemoteCursor } from './renderer';
 import { enqueue, currentRevision, currentRoomId } from './offline';
-import { isOnline } from './offline/connectivity';
+import type { Connectivity } from './offline/connectivity';
+import { isOnline, subscribeConnectivity } from './offline/connectivity';
 
 class WebSocketClient {
   private ws: WebSocket | null = null;
@@ -19,6 +20,10 @@ class WebSocketClient {
   constructor() {
     this.userId = crypto.randomUUID();
     this.username = `User ${Math.floor(Math.random() * 1000)}`;
+    // WS lifecycle guardrails: react to connectivity transitions. The
+    // subscription is permanent for this singleton; reconnecting is guarded on
+    // roomId so it is a no-op without an active room.
+    subscribeConnectivity((online) => this.onConnectivityChanged(online));
   }
 
   connect(roomId: string): void {
@@ -35,26 +40,34 @@ class WebSocketClient {
       return;
     }
 
-    this.ws.onopen = () => {
+    // Capture the live socket so handlers ignore events from a stale socket
+    // that has already been replaced (e.g. by a connectivity-driven reconnect).
+    const socket = this.ws;
+
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
       this.reconnectDelay = 1000;
       this.reconnectAttempts = 0;
       this.send({ type: 'request-sync' });
       window.dispatchEvent(new CustomEvent('excalidraw:ws-status', { detail: { connected: true } }));
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       const msg = JSON.parse(event.data) as ServerMessage;
       this.handleMessage(msg);
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
       window.dispatchEvent(new CustomEvent('excalidraw:ws-status', { detail: { connected: false } }));
       this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
-      // Silently close - onclose will handle reconnect
-      this.ws?.close();
+    socket.onerror = () => {
+      // Silently close - onclose will handle reconnect. Only touch the live
+      // socket; an error on a stale socket must not kill its replacement.
+      if (this.ws === socket) socket.close();
     };
   }
 
@@ -64,10 +77,49 @@ class WebSocketClient {
     this.ws = null;
     this.roomId = null;
     this.reconnectAttempts = 0;
+    this.reconnectDelay = 1000;
+    // The connectivity subscription stays (permanent singleton); every action
+    // it takes is guarded on this.roomId, so it no-ops once disconnected.
+  }
+
+  /**
+   * WS lifecycle guardrails, driven by connectivity transitions:
+   * - → offline: only hard-teardown when the network is provably dead
+   *   (navigator.onLine === false). If the machine still reports online, leave
+   *   the socket alone — a single failed request is not evidence of a dead
+   *   network.
+   * - → online: the backoff chain (1s→16s, 5 attempts) may already be
+   *   exhausted after a long offline period, so reset it and reconnect
+   *   immediately instead of waiting for a manual connect() call.
+   */
+  onConnectivityChanged(state: Connectivity): void {
+    if (state !== 'online') {
+      if (navigator.onLine === false && this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+        console.warn('[ws] navigator.onLine=false — closing socket (provably dead network)');
+        this.ws.close();
+      }
+      return;
+    }
+    const rs = this.ws?.readyState;
+    const dead = !this.ws || rs === WebSocket.CLOSED || rs === WebSocket.CLOSING;
+    if (this.roomId && dead) {
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.reconnectAttempts = 0;
+      this.reconnectDelay = 1000;
+      console.warn(`[ws] Back online — reconnecting to room ${this.roomId}`);
+      this.connect(this.roomId);
+    }
   }
 
   private scheduleReconnect(): void {
     if (!this.roomId) return;
+    // While the machine is provably offline, retrying is pointless: every
+    // attempt would fail. Going back online resets the backoff and reconnects
+    // (see onConnectivityChanged).
+    if (!isOnline()) return;
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.warn(`[ws] Max reconnect attempts (${this.maxReconnectAttempts}) reached. Use wsClient.connect() to retry.`);
       return;
