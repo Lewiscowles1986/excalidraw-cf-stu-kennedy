@@ -8,9 +8,9 @@ interface SessionInfo {
   ws: WebSocket;
 }
 
-// One-line warning cap: the registry being absent (some dev/test envs) must
-// warn once, not once per mutation.
-let registryWarned = false;
+// One-line warning cap: attribution failing (permutation of the DO storage
+// being unavailable) must warn once, not once per mutation.
+let contributorWarned = false;
 
 export class DrawingRoom extends DurableObject {
   private sessions: Map<WebSocket, SessionInfo> = new Map();
@@ -21,11 +21,6 @@ export class DrawingRoom extends DurableObject {
     ctx.blockConcurrencyWhile(async () => {
       this.migrate();
     });
-  }
-
-  /** The DO's stable name — idFromName(roomId), i.e. the roomId itself. */
-  private get roomName(): string {
-    return this.ctx.id?.name ?? '';
   }
 
   private get sql(): SqlStorage {
@@ -53,17 +48,16 @@ export class DrawingRoom extends DurableObject {
   }
 
   /**
-   * Attribute a mutation to the user who performed it. Two writes, both
-   * deliberately cheap and side-effect-free (no revision bump, no broadcast):
-   *   1. the room-local `contributors` table (single INSERT OR REPLACE);
-   *   2. the per-user RoomRegistry DO — one DO-to-DO fetch keyed on userId,
-   *      which is what makes "rooms you've edited" queryable cross-room.
-   * The registry is best-effort by design: a missing binding (dev/test without
-   * the v2 migration) or a transient DO error must never break drawing.
-   * Hot paths (live WS writes, PUT /elements) call this fire-and-forget
-   * (`void …`) so a slow registry can never delay a broadcast; attribution
-   * still lands, just asynchronously. Off-hot-path callers (offline replay)
-   * may await it. userIds longer than 128 chars are skipped, not thrown on.
+   * Attribute a mutation to the user who performed it: one room-local upsert
+   * into the `contributors` table. This is now the ONLY attribution store —
+   * the former per-user attribution DO it used to fan out to (one subrequest
+   * per edit) was removed: cross-room "rooms you've edited" queries fan out
+   * to each room's DO /contributors route instead (see the
+   * POST /api/rooms/accessible route in routes/api.tsx).
+   * Fire-and-forget on hot paths (live WS writes, PUT /elements) so a slow
+   * write can never delay a broadcast; attribution still lands asynchronously.
+   * Off-hot-path callers (offline replay) may await it. userIds longer than
+   * 128 chars are skipped, not thrown on.
    */
   private async recordContributor(userId: string | null): Promise<void> {
     if (!userId || userId.length > 128) return;
@@ -72,26 +66,12 @@ export class DrawingRoom extends DurableObject {
         'INSERT OR REPLACE INTO contributors (user_id, last_seen_at) VALUES (?, ?)',
         userId, Date.now()
       );
-
-      const registry = (this.env as any)?.ROOM_REGISTRY;
-      if (!registry) {
-        if (!registryWarned) {
-          console.warn('[room] ROOM_REGISTRY binding not available — room attribution skipped');
-          registryWarned = true;
-        }
-        return;
-      }
-      const stub = registry.get(registry.idFromName(userId));
-      const res = await stub.fetch(new Request('https://registry/record', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId, roomId: this.roomName, lastEditAt: Date.now() }),
-      }));
-      if (!res.ok) throw new Error(`registry /record → ${res.status}`);
     } catch (e) {
-      if (!registryWarned) {
-        console.warn('[room] failed to record room attribution', e);
-        registryWarned = true;
+      // Attribution must never break drawing: a failed upsert is logged (once
+      // per process, not per mutation) and swallowed.
+      if (!contributorWarned) {
+        console.warn('[room] failed to record contributor', e);
+        contributorWarned = true;
       }
     }
   }
@@ -148,17 +128,34 @@ export class DrawingRoom extends DurableObject {
     }
 
     // Contributor list for this room ("who has edited here") — consumed by
-    // tests and by the contribution registry plumbing.
+    // the POST /api/rooms/accessible fan-out (which passes ?userId= for SQL
+    // filtering here) and by the attribution guardrail tests.
     if (url.pathname === '/contributors' && request.method === 'GET') {
-      return this.handleGetContributors();
+      return this.handleGetContributors(url.searchParams);
     }
 
     return new Response('Not found', { status: 404 });
   }
 
-  private handleGetContributors(): Response {
-    const rows = this.sql
-      .exec('SELECT user_id, last_seen_at FROM contributors')
+  /**
+   * Contributor list for this room. Optional `?userId=` filters in SQL
+   * (WHERE user_id = ?) so cross-room listing probes transfer one row instead
+   * of the whole list; absent, all rows are returned (the public proxy route
+   * keeps full-list semantics). An over-cap (>128 chars) userId is rejected
+   * with 400 (matching the /accessible route's convention); an empty value
+   * is treated as absent (full list).
+   */
+  private handleGetContributors(params: URLSearchParams): Response {
+    const userId = params.get('userId');
+    if (userId !== null && userId.length > 128) {
+      return Response.json({ error: 'userId must be at most 128 characters' }, { status: 400 });
+    }
+    const where = userId && userId.length > 0 ? 'WHERE user_id = ?' : '';
+    const rows = (userId && userId.length > 0
+      ? this.sql
+        .exec(`SELECT user_id, last_seen_at FROM contributors ${where}`, userId)
+      : this.sql
+        .exec('SELECT user_id, last_seen_at FROM contributors'))
       .toArray() as unknown as Array<{ user_id: unknown; last_seen_at: unknown }>;
     return Response.json({
       contributors: rows.map((row) => ({

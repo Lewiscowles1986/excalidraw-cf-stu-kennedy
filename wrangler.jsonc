@@ -5,12 +5,10 @@
   "main": "./src/index.tsx",
   "durable_objects": {
     "bindings": [
-      { "name": "DRAWING_ROOM", "class_name": "DrawingRoom" },
-      { "name": "ROOM_REGISTRY", "class_name": "RoomRegistry" }
+      { "name": "DRAWING_ROOM", "class_name": "DrawingRoom" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["DrawingRoom"] },
-    { "tag": "v2", "new_sqlite_classes": ["RoomRegistry"] }
+    { "tag": "v1", "new_sqlite_classes": ["DrawingRoom"] }
   ]
 }

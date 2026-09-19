@@ -7,16 +7,87 @@ const app = new Hono<{ Bindings: CloudflareBindings }>();
 // Reachability probe for offline detection (light, cheap)
 app.get('/api/ping', (c) => c.json({ ok: true, t: Date.now() }));
 
-// "Rooms you've edited" registry: every room where this device's userId has
-// made an edit (WS or HTTP replay), most recent first. Backed by one
-// RoomRegistry DO per userId. An empty history is a plain empty list — no 404.
-app.get('/api/rooms', async (c) => {
-  const userId = c.req.query('userId');
-  if (!userId) {
+// "Rooms you can access" — fan-out to each requested room's DrawingRoom DO
+// and keep only the rooms whose `contributors` table includes this userId.
+// The client supplies the candidate roomIds (from its own IndexedDB history,
+// i.e. rooms the device genuinely edited on this device); the server only
+// ever *filters*, it never invents rooms.
+//
+// Acceptance note on DO materialization: probing an unknown roomId via
+// idFromName + stub.fetch does spin up an (empty) DrawingRoom DO with an
+// empty SQLite file. This is accepted by design: the cap below bounds the
+// blast radius to 100 rooms per request, and real clients only ever send
+// roomIds from their own IndexedDB history — rooms the device already
+// touched — so in practice only touched rooms are materialized.
+app.post('/api/rooms/accessible', async (c) => {
+  const body = await c.req.json().catch(() => null) as {
+    userId?: unknown;
+    roomIds?: unknown;
+  } | null;
+  if (!body || typeof body.userId !== 'string' || body.userId.length === 0) {
     return c.json({ error: 'userId is required' }, 400);
   }
-  const registry = c.env.ROOM_REGISTRY.get(c.env.ROOM_REGISTRY.idFromName(userId));
-  const res = await registry.fetch(new Request(`https://registry/list?userId=${encodeURIComponent(userId)}`));
+  if (body.userId.length > 128) {
+    return c.json({ error: 'userId must be at most 128 characters' }, 400);
+  }
+  if (!Array.isArray(body.roomIds) || body.roomIds.some((r) => typeof r !== 'string')) {
+    return c.json({ error: 'roomIds must be an array of strings' }, 400);
+  }
+  const roomIds = body.roomIds as string[];
+  if (roomIds.some((r) => r.length === 0 || r.length > 128)) {
+    return c.json({ error: 'each roomId must be 1-128 characters' }, 400);
+  }
+  if (roomIds.length > 100) {
+    return c.json({ error: 'too many roomIds (max 100)' }, 400);
+  }
+
+  const userId = body.userId;
+  // Dedupe: a repeated roomId is one DO probe, not N.
+  const unique = [...new Set(roomIds)];
+
+  const rooms = (await Promise.all(unique.map(async (roomId) => {
+    const stub = c.env.DRAWING_ROOM.get(c.env.DRAWING_ROOM.idFromName(roomId));
+    try {
+      // Push the filter into the room's SQLite (WHERE user_id = ?): the probe
+      // fetch transfers one row, not the room's whole contributor list.
+      const res = await stub.fetch(new Request(`https://do/contributors?userId=${encodeURIComponent(userId)}`));
+      const data = await res.json() as { contributors?: Array<{ userId?: unknown; lastSeenAt?: unknown }>, error?: unknown };
+      // A 400 here means the room rejected our userId (>128 chars) — no row
+      // exists for it in that room, so filter it out (the route validates
+      // the same cap up front, so this is belt-and-suspenders).
+      if (!res.ok) return null;
+      const contributors = Array.isArray(data.contributors) ? data.contributors : [];
+      // JS-side fallback check on top of the server-side SQL filter, against
+      // the filtered row shape ({ userId, lastSeenAt }).
+      const mine = contributors.find((row) => row.userId === userId);
+      // Only rooms the user actually edited. A room whose DO exists but never
+      // recorded this user (or a never-materialized roomId) is filtered out —
+      // never created, never attributed.
+      if (!mine) return null;
+      return { roomId, lastSeenAt: (typeof mine.lastSeenAt === 'number' ? mine.lastSeenAt : 0) || 0 };
+    } catch {
+      // A single room's DO failure must not fail the whole listing.
+      return null;
+    }
+  }))).filter((room): room is { roomId: string; lastSeenAt: number } => room !== null)
+    // Most recently edited first, matching the old registry listing's order.
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+
+  return c.json({ rooms });
+});
+
+// Contributor list for a room ("who has edited here") — the public surface of
+// the DrawingRoom DO's internal /contributors route. Deliberately readable
+// without auth (same posture as every other room route); exists for
+// observability and the attribution guardrail tests.
+app.get('/api/rooms/:roomId/contributors', async (c) => {
+  const roomId = c.req.param('roomId');
+  // Pass ?userId= through when the caller supplies it: the DO filters in SQL
+  // and returns just that row. Absent, the DO returns the full list.
+  const userId = c.req.query('userId');
+  const qs = userId !== undefined && userId !== '' ? `?userId=${encodeURIComponent(userId)}` : '';
+  const stub = c.env.DRAWING_ROOM.get(c.env.DRAWING_ROOM.idFromName(roomId));
+  const res = await stub.fetch(new Request(`https://do/contributors${qs}`));
   return c.json(await res.json());
 });
 

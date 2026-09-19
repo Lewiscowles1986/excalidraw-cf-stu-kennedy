@@ -6,7 +6,6 @@ import apiRoutes from './routes/api';
 import sseRoutes from './routes/sse';
 
 export { DrawingRoom } from './do/drawing-room';
-export { RoomRegistry } from './do/room-registry';
 
 const app = new Hono<{ Bindings: CloudflareBindings }>();
 
