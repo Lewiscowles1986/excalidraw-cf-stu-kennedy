@@ -214,9 +214,9 @@ WebRTC proposal cannot cover, and it is worth engineering for *eyes open*:
   strokes — a single freedraw polyline would need multi-KB chunking, and
   latency (~60–100ms connection intervals) makes strokes feel rubber-banded.
 - **UX friction:** `requestDevice()` requires a user gesture and shows a
-  chooser; HTTPS (secure context) required — the service worker precache
-  already gives us the app shell, and the page can be served once then used
-  offline forever.
+  chooser; HTTPS (secure context) required — the service worker's runtime
+  cache already gives us the app shell, and the page can be served once then
+  used offline forever.
 - **No broadcast discovery:** the JS API is connect-and-subscribe; there is no
   background scan of arbitrary advertisements (scanning is experimental and
   gated).

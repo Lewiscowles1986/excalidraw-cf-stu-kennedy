@@ -113,7 +113,7 @@ Ordinary caching mirrors server state so you can *read* offline. Local-first goe
 ### The pieces
 
 1. **Connectivity detection (`client/offline/connectivity.ts`)** treats **`navigator.onLine` as the trusted source of truth**: the app flips online/offline only when the browser's `online`/`offline` events fire. There is deliberately **no ping probe** — a single failed `/api/ping` is not evidence of a dead network, so the app must not flip to offline on request failures.
-2. **IndexedDB store (`client/offline/database.ts`)** keeps a per-room snapshot (`OfflineRoom`) plus an append-only **event log** (the outbox). A service worker (`public/sw.js`) precaches static assets so the app shell itself boots offline.
+2. **IndexedDB store (`client/offline/database.ts`)** keeps a per-room snapshot (`OfflineRoom`) plus an append-only **event log** (the outbox). A service worker (`public/sw.js`) — a committed static file, no build-time precache — lazily caches the canonical documents and assets it serves, so the app shell itself boots offline.
 3. **Outbox (`client/ws-client.ts`)** — every user mutation is appended to IndexedDB *before* any socket/HTTP send. The legacy `flushAll`/`saveViaHttp` paths are gated on connectivity so offline edits are never dropped.
 4. **Sync engine (`client/offline/sync.ts`)** replays the outbox to the server on reconnect via `PUT /api/rooms/:roomId/events`, sending its **base revision** so the server can detect divergence:
    - **revision matches** → ops apply cleanly (`synced`), outbox drains, room marked clean.

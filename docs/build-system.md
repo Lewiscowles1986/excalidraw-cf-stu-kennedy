@@ -51,9 +51,8 @@ graph TD
     MANI["dist/client/.vite/manifest.json"]
     HASJH["dist/client/assets/canvas-&lt;hash&gt;.js"]
     HASCSS["dist/client/assets/style-&lt;hash&gt;.css"]
-    SWGEN["dist/client/sw.js<br/><i>generated precache</i>"]
+    SWSTAT["public/sw.js<br/><i>static SW, runtime cache</i>"]
     WORKER["dist/excalidraw_cf/index.js"]
-    SWT["service-worker.template.js"]
 
     %% ── Edges: config drives build ─────────────────
     VTC -- "loads" --> VITE
@@ -69,13 +68,9 @@ graph TD
     CSS -- "entry" --> VITE
     VITE -- "emit (hashed)" --> HASJH
     VITE -- "emit (hashed)" --> HASCSS
-    MANI -- "index of hashed files" --> SWGEN
 
-    %% ── SW precache is generated, not hard-coded ───
-    SWT -- "template" --> VITE
-    VITE -- "inject precache from manifest" --> SWGEN
-    SWGEN -- "precache list" --> HASJH
-    SWGEN -- "precache list" --> HASCSS
+    %% ── SW is a committed static file; cache built at runtime ───
+    SWSTAT -- "seeds '/' at install;\n SWR-caches assets +\n canonical docs online" --> RUNTIME["Cache Storage<br/><i>runtime-seeded</i>"]
 
     %% ── Backend → worker bundle ────────────────────
     IDX -- "SSR shell" --> RDR
@@ -85,7 +80,7 @@ graph TD
 
     style PLUGIN1 fill:#4a90d9,color:#fff
     style PLUGIN2 fill:#7a5aa9,color:#fff
-    style SWGEN fill:#2ea043,color:#fff
+    style SWSTAT fill:#2ea043,color:#fff
     style WORKER fill:#d29922,color:#fff
 ```
 
@@ -97,9 +92,12 @@ graph TD
 - **Two outputs come out of one build.** The **client bundle** (hashed `canvas-*.js`,
   `style-*.css`) for browsers, and the **SSR/worker bundle** (`dist/excalidraw_cf/index.js`)
   for Cloudflare.
-- **The service worker precache is now *generated*.** `sw.js` is produced from
-  `service-worker.template.js` by reading `dist/client/.vite/manifest.json`, so it
-  always caches the real hashed files — never the dev-only `/src/...` source paths.
+- **The service worker is a committed static file with no build involvement.**
+  `public/sw.js` builds its cache **at runtime**: install seeds the landing
+  document `'/'`, successful online navigations are cached under their own URL
+  (canvas-shaped pages additionally seed the roomless `/shell` canonical dummy),
+  and hashed assets populate lazily via stale-while-revalidate as pages load.
+  No precache list, no manifest reading — nothing for the build to inject.
 
 ---
 
@@ -172,7 +170,7 @@ moving on to `vite preview` / `wrangler deploy`.
 | `src/client/offline/*` | Offline engine: sw-reg, connectivity, IndexedDB db, sync, offline-ui |
 | `src/client/ws-client.ts` | WebSocket client + offline-first enqueue/live send |
 | `src/style.css` | Global stylesheet |
-| `public/sw.js` | Hand-written service worker (precache + cache-first shell) |
+| `public/sw.js` | Committed static service worker (runtime canonical-document cache) |
 
 ### Tools
 
@@ -193,8 +191,9 @@ moving on to `vite preview` / `wrangler deploy`.
 
 This is the fuller **coupling-focused** view. It differs from **Section 0** like this:
 
-- **Section 0** is the *lean, output-oriented* view — "what the build emits," with the
-  now-generated service-worker precache highlighted.
+- **Section 0** is the *lean, output-oriented* view — "what the build emits." The
+  service worker is deliberately **not** part of the build: it is a committed
+  static file whose cache is populated at runtime (see Section 0's "Reading it").
 - **Section 3** is the *coupling-oriented* view — "how everything talks to
   everything." The important extra it captures is the **`$npm_execpath` recursive
   build**: `deploy`/`preview` first re-invoke the package manager to build, *then*
@@ -232,7 +231,7 @@ graph TD
     OFFLINE["src/client/offline/*<br/>connectivity, db, sync,<br/>offline-ui, sw-reg"]
     WSCL["src/client/ws-client.ts"]
     STYLE["src/style.css"]
-    SW["public/sw.js<br/><i>service worker</i>"]
+    SW["public/sw.js<br/><i>static service worker</i>"]
 
     %% ── Scripts → tools (the recursive-build coupling) ──
     PKG -. dev .-> VITE
@@ -266,8 +265,8 @@ graph TD
     CANVAS -- "imports" --> OFFLINE
     CANVAS -- "imports" --> WSCL
     OFFLINE -- "registers" --> SW
-    SW -- "precaches" --> STYLE
-    SW -- "precaches" --> CANVAS
+    SW -- "seeds '/' at install" --> RUNTIMEC["Cache Storage<br/><i>runtime-seeded</i>"]
+    SW -- "SWR-caches assets +\n canonical docs online" --> RUNTIMEC
 
     %% ── Routes / DO / WS ─────────────────────────────
     IDX -- "mounts" --> RT
@@ -297,7 +296,7 @@ graph TD
 | **SSR rendering** | `src/index.tsx` → `src/renderer.tsx` (`jsxRenderer` + `vite-ssr-components`) |
 | **Client bundle entry** | `src/client/canvas.ts` (from `renderer.tsx` `<Script>`) |
 | **Durable Object entry** | class `DrawingRoom` in `src/do/drawing-room.ts` |
-| **Service worker** | generated `dist/client/sw.js` from `service-worker.template.js`, registered from `src/client/offline/service-worker.ts` |
+| **Service worker** | committed static `public/sw.js` (copied verbatim to `dist/client/sw.js`), registered from `src/client/offline/service-worker.ts` |
 
 ---
 
@@ -324,13 +323,15 @@ graph TD
 2. **The `$npm_execpath` recursion is the core "coupled build" trick.** `deploy` and
    `preview` each run a recursive build through the same package manager first.
 
-3. **The offline precache is now *generated*, closing the stale-path bug.** The
-   service worker no longer hard-codes `/src/...` source routes (those don't exist
-   in production, where Vite emits hashed files like `canvas-<hash>.js`). Instead a
-   Vite plugin renders `service-worker.template.js` into `dist/client/sw.js`, filling
-   the precache list from `dist/client/.vite/manifest.json`. So the precache always
-   matches the *real, hashed* assets the renderer ships — no hand-maintained
-   lockstep between `renderer.tsx` and `sw.js` anymore.
+3. **The offline cache is runtime-seeded, not build-injected.** The service
+   worker is a committed static file (`public/sw.js`) with no precache list and
+   no Vite-plugin involvement. At install it caches only the landing document
+   `/`; while online, every successful navigation is cached under its own URL,
+   canvas-shaped pages additionally seed the roomless `/shell` canonical dummy,
+   and assets (hashed chunks in prod, `/src/*.ts` dev modules in dev) enter the
+   cache via stale-while-revalidate as pages load. Versioning is a manual
+   `CACHE_VERSION` constant — bump it, and the old cache is deleted on activate.
+   The build's only role is copying `public/` through as-is.
 
 4. **"Offline" needs a careful nuance — the app is *mostly* frontend, not all-or-nothing.**
 
@@ -357,14 +358,17 @@ The gap is purely that the *route to the canvas* currently comes from the server
 Options, roughly in increasing effort:
 
 1. ~~**Rely on the service-worker navigation fallback.**~~ **IMPLEMENTED** — the
-   SW's navigation handler is now *network-first* with a route-aware offline
-   fallback: `/d/:roomId`, `/new` and `/join` fall back to the precached
-   `/shell` canvas document (everything else to the cached landing page).
-2. ~~**Precache the room route(s).**~~ **IMPLEMENTED (combined with 1)** — a
-   dedicated `/shell` route (same `DrawingPage` SSR, no roomId) is precached in
-   both dev and build lists; the client derives the real room from
-   `location.pathname` at boot (`src/client/canvas.ts` mints `/new` rooms and
-   resolves `/join?room=X` offline).
+   SW's navigation handler is *network-first* with a route-aware offline
+   fallback: `/d/:roomId`, `/new` and `/join` fall back to the cached `/shell`
+   canvas document (everything else to the cached landing page).
+2. ~~**Precache the room route(s).**~~ **SUPERSEDED by the runtime canonical-
+   document model** — no build-time precache exists anymore. `/shell` (same
+   `DrawingPage` SSR, no roomId) is the canonical roomless dummy, cached at
+   runtime by the SW: any successful canvas-shaped navigation seeds it, so
+   real online usage warms exactly the documents offline boots need. The
+   client derives the real room from `location.pathname` at boot
+   (`src/client/canvas.ts` mints `/new` rooms and resolves `/join?room=X`
+   offline), so the cached document's embedded SSR signal is inert.
 3. **Prerender the shell from the build** instead of at request time (move the
    SSR template from `renderer.tsx` into static HTML during `vite build`). This is
    the bigger architectural move: it removes the server from the *page-delivery*

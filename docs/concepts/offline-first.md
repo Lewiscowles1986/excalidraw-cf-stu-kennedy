@@ -41,8 +41,10 @@ online collaborators see them.
     browser: `navigator.onLine` and the `online`/`offline` events decide).
   - `database.ts` — the in-browser storage (IndexedDB) + the queued outbox.
   - `sync.ts` — the "sync now that I'm back" engine.
-  - `service-worker.ts` — registers the service worker that pre-caches the app.
-- `public/sw.js` — the service worker that makes the app load with no internet.
+  - `service-worker.ts` — registers the service worker that keeps the app
+    loadable offline: it builds its cache at runtime from the canonical
+    documents and assets it actually serves (no build-time precache list).
+- `public/sw.js` — the static service worker that makes the app load with no internet: it caches the canonical documents and assets it observes at runtime (no build-time precache list).
 - `src/client/ws-client.ts` — routes every edit through the offline queue first,
   then sends it live when possible.
 

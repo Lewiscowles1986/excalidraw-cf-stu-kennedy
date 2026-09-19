@@ -33,7 +33,7 @@ export function init(): void {
   setupOfflineUI();
 
   // Offline route reconciliation, BEFORE the /d/ match. When the SW served
-  // the precached '/shell' document instead of the server redirect (i.e. we
+  // the cached '/shell' document instead of the server redirect (i.e. we
   // are offline), /new and /join arrive as-is and are resolved client-side;
   // online these still server-redirect (network-first SW passes through) and
   // both paths converge on /d/:id.
@@ -48,7 +48,7 @@ export function init(): void {
     if (!room) {
       // replaceState would leave the roomless shell inert (toolbar alive, no
       // render loop); location.replace('/') boots the real landing — offline
-      // the SW serves the precached '/' document.
+      // the SW serves the cached '/' document.
       location.replace('/');
       return;
     }

@@ -12,9 +12,6 @@ dist-server/
 .idea/usage.statistics.xml
 .idea/shelf
 
-# generated service worker (produced at dev time by vite plugin)
-public/sw.js
-
 # deps
 node_modules/
 .wrangler

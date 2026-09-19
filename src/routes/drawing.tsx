@@ -45,11 +45,12 @@ app.get('/join', (c) => {
   return c.redirect(`/d/${room}`);
 });
 
-// Offline canvas shell: the same DrawingPage SSR'd WITHOUT a roomId. The
-// service worker precaches this document and serves it for offline
-// navigations to /d/:roomId, /new and /join — the client then derives the
-// real roomId from location.pathname at boot (see src/client/canvas.ts),
-// so one cached document covers every canvas-shaped URL.
+// Offline canvas shell: the same DrawingPage SSR'd WITHOUT a roomId. This is
+// the canonical roomless canvas document — the canonical dummy the service
+// worker serves for offline navigations to /d/:roomId, /new and /join. The SW
+// caches it at runtime (any canvas-shaped navigation seeds '/shell'); the
+// client derives the real roomId from location.pathname at boot (see
+// src/client/canvas.ts), so one cached document covers every canvas-shaped URL.
 app.get('/shell', (c) => {
   return c.render(<DrawingPage />);
 });

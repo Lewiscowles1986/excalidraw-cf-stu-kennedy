@@ -49,7 +49,7 @@ server's page template (`renderer.tsx`) and the browser assets have to match.
 
 - `vite.config.ts` — the factory's settings (which plugins, so which kind of build).
 - `package.json` → the `scripts` — `build` (run Vite), plus `dev`/`preview`/`deploy`.
-- `public/` — bits copied through *as-is* (like `sw.js`, the service worker and
+- `public/` — bits copied through *as-is* (like `sw.js`, the committed static service worker, and
   `favicon.ico`) that don't need bundling.
 
 ## What "deploy" does

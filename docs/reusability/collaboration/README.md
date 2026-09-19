@@ -106,7 +106,7 @@ app-specific and stays behind.
 | `ExcalidrawElement` types | Your domain objects replace these. The *row contract* in §5 is all the server needs |
 | `src/views/*` UI, `bridge.ts`, `sse.tsx` (Datastar) | App's presentation & SSR wiring. The SSE routes here are **UI-state fan-out**, not room collaboration — do not confuse them |
 | Element factory, icons, color picker, export/import | Canvas features |
-| `public/sw.js` asset precaching | Reusable in *principle* (offline app shell), but the cache manifest is app-specific |
+| `public/sw.js` runtime asset caching | Reusable in *principle* (offline app shell), but the canonical-document routes are app-specific |
 
 The litmus test from §2 is also the boundary test: **anything that knows about
 "elements" by name is app-specific; anything that only knows about "ops,

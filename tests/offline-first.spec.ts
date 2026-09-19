@@ -52,7 +52,7 @@ async function ensureServiceWorkerReady(page: Page): Promise<void> {
 }
 
 // Step 5: cut the network fully (blocks fetch AND WebSocket) AFTER the SW has
-// already precached the shell + assets.
+// already runtime-cached the documents + assets the page just used online.
 async function goOffline(context: BrowserContext, page: Page): Promise<void> {
   await context.setOffline(true);
   // Tell the app's connectivity monitor we are offline now.
@@ -254,7 +254,8 @@ test('works the same after install-sw → go-offline → draw (trivial offline-f
   // 1+2. load online
   const roomId = await loadOnline(page);
 
-  // 3+4. ensure service worker is active + controlling (assets precached)
+  // 3+4. ensure service worker is active + controlling (documents runtime-cached
+  // by the SW as the page loaded them)
   await ensureServiceWorkerReady(page);
 
   // 5. disable networking once all downloads have finished
@@ -322,20 +323,22 @@ test('queued offline edits drain to the server once back online', async ({ page,
 // ═══════════════════════════════════════════════════════════════════════════
 // OFFLINE NAVIGATION: the SW's navigation handler is now NETWORK-FIRST (fresh
 // SSR while online) with a route-aware offline fallback — /d/:id, /new and
-// /join fall back to the precached '/shell' canvas document (everything else
-// to the cached landing page), so the canvas itself is reachable with no
-// server. Implemented per docs/build-system.md "What next" options 1+2
-// combined (the /shell route + client-side route reconciliation in
-// src/client/canvas.ts).
+// /join fall back to the runtime-cached '/shell' canvas document (everything
+// else to the cached landing page), so the canvas itself is reachable with no
+// server. The SW caches '/shell' at runtime from any canvas-shaped navigation
+// (per docs/build-system.md "What next" option 1; option 2's build-time
+// precache is superseded by the runtime canonical-document model). The
+// /shell route + client-side route reconciliation live in src/client/canvas.ts.
 // ═══════════════════════════════════════════════════════════════════════════
 test('the canvas page itself stays reachable offline via the cached shell', async ({ page, context }) => {
   const roomId = await loadOnline(page);
   await ensureServiceWorkerReady(page);
 
   // Warm pass: one SW-CONTROLLED online load so the runtime cache holds the
-  // dev module graph (the dev precache lists only entry modules; in a
-  // production build the manifest covers every chunk, so this step is a
-  // dev-test necessity, not an app requirement).
+  // dev module graph (the SW builds its cache from documents/assets it serves
+  // at runtime, so one controlled online load warms it — in production the
+  // hashed chunks populate the same way, so this step is a dev-test
+  // necessity, not an app requirement).
   await page.reload();
   await page.waitForSelector('#excalidraw-canvas');
 
@@ -357,6 +360,13 @@ test('offline navigation to /new mints a room and boots the canvas', async ({ pa
   // Warm the SW cache with the full module graph (online load).
   await loadOnline(page);
   await ensureServiceWorkerReady(page);
+
+  // Warm pass: one SW-CONTROLLED canvas load so the runtime cache holds the
+  // canvas document (which seeds '/shell') + the dev module graph. The load
+  // above ran before the SW took control, so without this the SW never saw a
+  // canvas-shaped navigation and has nothing to fall back to offline.
+  await page.reload();
+  await page.waitForSelector('#excalidraw-canvas');
 
   // Back to the landing page while STILL ONLINE (the user is on '/' when the
   // connection drops, then clicks "New Drawing" — the canvas page has no such
@@ -390,6 +400,12 @@ test('offline join via /join?room=X boots the cached room', async ({ page, conte
   // Create room A online (same context ⇒ same IndexedDB for the join).
   const roomA = await loadOnline(page);
   await ensureServiceWorkerReady(page);
+
+  // Warm pass: one SW-CONTROLLED canvas load so the runtime cache holds the
+  // canvas document (which seeds '/shell') + the dev module graph (same
+  // rationale as the /new test above).
+  await page.reload();
+  await page.waitForSelector('#excalidraw-canvas');
 
   // Back to the landing page while STILL ONLINE (join flow, not reload path).
   await page.goto('/');
@@ -818,4 +834,57 @@ test('a background room that diverged keeps its outbox and warns via sync-status
   expect(local.dirty).toBe(true);
   const server = (await readServerElements(page, divergedRoomId)) as Array<{ id: string }>;
   expect(server.map((e) => e.id)).toEqual(['seed-el-server-1']);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RUNTIME-SEEDED CACHE: the service worker has NO build-time precache list —
+// it builds its cache at runtime from the canonical documents it observes.
+// Install seeds only '/'; online usage then lazily caches the rest. This test
+// pins that contract: after normal online use (no precache machinery), the
+// SW cache holds '/' and the canvas document, and an offline reload still
+// boots the canvas from that runtime-seeded cache.
+// ═══════════════════════════════════════════════════════════════════════════
+test('service worker populates its cache at runtime from canonical documents', async ({ page, context }) => {
+  // 1+2. load online, exactly as the suite always does (no precache step).
+  const roomId = await loadOnline(page);
+
+  // 3+4. SW active + controlling.
+  await ensureServiceWorkerReady(page);
+
+  // Warm pass: one SW-controlled online load so the SWR branch caches the dev
+  // module graph (dev serves unbundled /src/*.ts modules; production build
+  // emits hashed chunks — either way they populate through real usage).
+  await page.reload();
+  await page.waitForSelector('#excalidraw-canvas');
+
+  // The runtime cache now exists and holds the canonical landing document
+  // ('/' seeded at install, confirmed present at runtime) — evidence the
+  // cache is runtime-populated, not a build-time artifact.
+  const cacheKeys = await page.evaluate(async () => (await caches.keys()).join(','));
+  expect(cacheKeys).toContain('excalidraw-cf-v3-runtime');
+  const landingCached = await page.evaluate(async () =>
+    (await caches.match('/')) !== undefined,
+  );
+  expect(landingCached).toBe(true);
+  // The canvas-shaped navigation was cached at runtime too: '/d/<roomId>' is
+  // in the cache, and the roomless '/shell' canonical dummy was seeded from it.
+  const canvasCached = await page.evaluate(
+    async (url: string) => (await caches.match(url)) !== undefined,
+    `/d/${roomId}`,
+  );
+  expect(canvasCached).toBe(true);
+  const shellCached = await page.evaluate(async () =>
+    (await caches.match('/shell')) !== undefined,
+  );
+  expect(shellCached).toBe(true);
+
+  // 5. cut the network; the runtime cache must carry the app alone.
+  await goOffline(context, page);
+  await page.reload();
+  await page.waitForSelector('#excalidraw-canvas', { timeout: 20_000 });
+
+  // 7. offline boot really came from the SW cache: canvas reachable, URL
+  // unchanged (the room survived the offline reload).
+  await expect(page.locator('#offline-banner')).toBeVisible();
+  expect(page.url()).toContain(`/d/${roomId}`);
 });
