@@ -62,9 +62,37 @@ The simple, honest answer this app uses is **"avoid merging: fork."**
   never get a messy half-merge. (Fancier merge strategies exist, but "fork when
   in doubt" is the safe, clear starting point.)
 
+### Before offering a fork: prove it's a real conflict
+
+A fork prompt is a big deal, so the app tries hard **not** to show one unless a
+genuine two-way conflict remains:
+
+- **The server keeps its base up to date.** Every snapshot the server hands over
+  — the WebSocket `full-sync` reply now carries the room's `revision` — is
+  adopted as your local base (forward-only; `dirty` stays true while the outbox
+  still has rows). Without this, an online session delivered entirely over
+  WebSockets would leave a stale base behind and the *next* reconnect would look
+  "diverged" even though the server already has everything.
+- **The settle window is deadline-based, not attempt-counted.** When a replay
+  comes back "diverged", the client polls the authoritative room state for up to
+  **10 seconds** (every 500ms) to see whether the server already absorbed the
+  queued ops live over the WebSocket. A reconnecting network can leave `/state`
+  unreachable for many seconds — those failures are retried, not counted as
+  evidence of a conflict. If the machine goes offline mid-settle, the deadline
+  is extended (up to a 30s cap) instead of burning the budget.
+- **An unreachable or offline settle never prompts.** If the window expires
+  while offline, or the server was never successfully reached during it, the
+  outbox is simply kept and the sync retried later — no fork prompt. Likewise,
+  if connectivity drops *during* reconciliation, the fork offer is aborted
+  outright (`Local changes kept — will retry when back online`).
+- **Only then: fork.** A fork prompt fires solely when the deadline expired
+  *while online*, with successful state fetches, whose snapshots never contained
+  your queued ops — i.e. a real two-way conflict.
+
 > Think of it like two writers editing the same document. Sometimes you can just
 > combine their notes. When you genuinely can't, you make a fresh copy — a fork —
-> so nobody loses their words.
+> so nobody loses their words. But first you make sure the other writer's notes
+> are really there: a dropped connection is not an argument.
 
 ## Why it matters
 

@@ -337,7 +337,17 @@ export class DrawingRoom extends DurableObject {
 
       case 'request-sync': {
         const elements = this.loadAllElements();
-        this.sendTo(ws, { type: 'full-sync', elements });
+        // The reply carries the room's revision (+ lastEditAt) so the client
+        // can adopt it as its local base: an online session delivered entirely
+        // over WS must not leave a stale base behind for the next outbox
+        // replay (a stale base makes the replay diverge against a server that
+        // already holds everything → spurious fork prompts).
+        this.sendTo(ws, {
+          type: 'full-sync',
+          elements,
+          revision: await this.getRevision(),
+          lastEditAt: this.getLastEditAt(),
+        });
         break;
       }
 

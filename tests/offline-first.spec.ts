@@ -556,6 +556,175 @@ test('diverged replay after a server-side edit keeps local data and offers a for
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SETTLE WINDOW (false-conflict guard): while the app is reconnecting,
+// /api/rooms/:id/state can be unreachable for several seconds. The old
+// tryBenignDrain sprinted 6×250ms (~1.5s) and then offered a fork anyway —
+// exactly the spurious "Conflicting changes detected" the product owner hit.
+// Here the divergence is real-looking (the replay's diverged snapshot is
+// frozen BEFORE the WS delivery of our queued op) but the server ALREADY
+// holds the queued op (absorbed live over the WebSocket). /state is blocked
+// for the first ~3s of the settle: the engine must keep polling (deadline-
+// based), settle benignly once /state is readable, and NEVER prompt a fork.
+// ═══════════════════════════════════════════════════════════════════════════
+test('transient network failure during divergence settle does not prompt a fork', async ({ page, context }) => {
+  const roomId = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+
+  // Collect fork prompts + conflict warnings from before the reconnect.
+  await page.evaluate(() => {
+    (window as any).__forkPrompts = [] as string[];
+    (window as any).__conflictStatus = [] as string[];
+    window.addEventListener('excalidraw:fork-prompt', ((e: CustomEvent) => {
+      (window as any).__forkPrompts.push(e.detail?.roomId ?? null);
+    }) as EventListener);
+    window.addEventListener('excalidraw:sync-status', ((e: CustomEvent) => {
+      if (e.detail?.kind === 'warning') (window as any).__conflictStatus.push(e.detail.message);
+    }) as EventListener);
+  });
+
+  // Online: draw and let the outbox settle so the base revision is real.
+  await blockLegacyElementUploads(context, roomId);
+  await drawRectangle(page);
+  await expect.poll(() => queuedOpCount(page), { timeout: 10_000 }).toBe(0);
+  const onlineEls = (await readServerElements(page, roomId)) as Array<{ id: string }>;
+  expect(onlineEls.length).toBe(1);
+  const onlineElId = onlineEls[0].id;
+
+  // "Believed-offline" WITHOUT cutting the network: dispatch the offline
+  // event only, so the app queues the next edit while the WebSocket stays
+  // OPEN — the queued frame is absorbed live (the server revision moves).
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+  await expect(page.locator('#offline-banner')).toBeVisible();
+  await drawRectangle(page);
+  await page.waitForTimeout(700);
+  expect(await queuedOpCount(page)).toBe(1);
+  // The WS frame landed: the server now holds BOTH elements.
+  await expect
+    .poll(async () => (await readServerElements(page, roomId)).length, { timeout: 10_000 })
+    .toBe(2);
+
+  // The race tryBenignDrain exists for: the replay's diverged snapshot is
+  // FROZEN before the WS delivery (only the online element), and /state is
+  // unreachable for the first ~3s of the settle window. With the old
+  // 6×250ms sprint the engine gave up mid-outage and offered a fork for a
+  // conflict that did not exist.
+  const stateNow = await (await page.request.get(`/api/rooms/${roomId}/state`)).json();
+  const blockUntil = Date.now() + 3_000;
+  await context.route(`**/api/rooms/${roomId}/events`, (route) => {
+    if (route.request().method() === 'PUT') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ok: false,
+          diverged: true,
+          revision: stateNow.revision,
+          lastEditAt: stateNow.lastEditAt,
+          elements: (stateNow.elements as Array<{ id: string }>).filter((e) => e.id === onlineElId),
+        }),
+      });
+    }
+    return route.continue();
+  });
+  await context.route(`**/api/rooms/${roomId}/state`, (route) => {
+    if (Date.now() < blockUntil) return route.abort();
+    return route.continue();
+  });
+
+  // Kick the sync engine (same nudge the drain test performs inline).
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('offline'));
+    window.dispatchEvent(new Event('online'));
+    window.dispatchEvent(new CustomEvent('excalidraw:connectivity', { detail: { online: true } }));
+  });
+
+  // Mid-settle (while /state is still blocked): the divergence was detected,
+  // nothing drained yet, and NO fork prompt may have fired (RED evidence: the
+  // old engine fast-failed here and prompted).
+  await page.waitForTimeout(2_500);
+  expect(await queuedOpCount(page)).toBe(1);
+  const promptsMid = await page.evaluate(() => (window as any).__forkPrompts ?? []);
+  expect(promptsMid, 'no fork prompt may fire while the settle window is open').toHaveLength(0);
+  await expect(page.locator('#fork-modal')).toBeHidden();
+
+  // /state becomes readable after ~3s: the benign drain must complete —
+  // outbox drained, server holding both elements, snapshot reconciled.
+  await expect.poll(() => queuedOpCount(page), { timeout: 15_000 }).toBe(0);
+  await expect
+    .poll(async () => (await readServerElements(page, roomId)).length, { timeout: 10_000 })
+    .toBe(2);
+  const local = await readLocalRoom(page, roomId);
+  expect(local, 'room snapshot should exist locally').toBeTruthy();
+  expect(local.dirty).toBe(false);
+  const promptsEnd = await page.evaluate(() => (window as any).__forkPrompts ?? []);
+  expect(promptsEnd, 'no fork prompt may fire at any point').toHaveLength(0);
+  const conflicts = await page.evaluate(() => (window as any).__conflictStatus ?? []);
+  expect(conflicts, 'no conflict warning may be emitted').toHaveLength(0);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FULL-SYNC REVISION ABSORPTION: the WS full-sync reply now carries the
+// room's revision, so the client keeps its local base current from every
+// server state it sees. Observable: a room whose server revision advanced
+// via a live collaborator (no HTTP replay on our side) has its local
+// snapshot's revision advanced by a plain reload (WS reopens → request-sync
+// → full-sync), with no outbox and no dirty flag.
+// ═══════════════════════════════════════════════════════════════════════════
+test('full-sync advances the local base revision', async ({ browser }) => {
+  // Browser A: fresh room, one element drawn (and synced) while online.
+  const aContext = await browser.newContext();
+  const aPage = await aContext.newPage();
+  const roomId = await loadOnline(aPage);
+  await ensureServiceWorkerReady(aPage);
+  await blockLegacyElementUploads(aContext, roomId);
+  await drawRectangle(aPage);
+  await expect.poll(() => queuedOpCount(aPage), { timeout: 10_000 }).toBe(0);
+  const before = await readLocalRoom(aPage, roomId);
+  expect(before, 'room snapshot should exist locally').toBeTruthy();
+  expect(before.revision).toBeGreaterThan(0);
+
+  // Browser B (isolated context) joins live and draws over the WebSocket:
+  // the server revision advances WITHOUT A seeing any HTTP replay (A is
+  // idle; only the WS element-update frame arrives).
+  const bContext = await browser.newContext();
+  const bPage = await bContext.newPage();
+  await bPage.goto(`/d/${roomId}`);
+  await bPage.waitForSelector('#excalidraw-canvas');
+  await drawRectangle(bPage);
+  await bPage.waitForTimeout(800);
+  // Wait until the server holds both elements (B's WS frame + B's own replay
+  // settle) so the revision we capture can no longer move.
+  await expect
+    .poll(async () => (await readServerElements(aPage, roomId)).length, { timeout: 10_000 })
+    .toBe(2);
+  const stateNow = await (await aPage.request.get(`/api/rooms/${roomId}/state`)).json();
+  expect(stateNow.revision).toBeGreaterThan(before.revision);
+
+  // A reloads: the WS reopens → request-sync → full-sync now carries the
+  // revision → the local snapshot must adopt it (no replay ran on A's side,
+  // so this advance can only come from full-sync absorption).
+  await aPage.reload();
+  await aPage.waitForSelector('#excalidraw-canvas');
+  await expect
+    .poll(async () => (await readLocalRoom(aPage, roomId))?.revision, { timeout: 10_000 })
+    .toBe(stateNow.revision);
+  const after = await readLocalRoom(aPage, roomId);
+  expect(after.dirty).toBe(false);
+  // Mechanism check: the adoption was logged by the full-sync path.
+  const dbgAdopt = await aPage.evaluate(() =>
+    ((window as any).__dbg ?? [] as string[]).some((l: string) => l.includes('full-sync-rev|adopt')),
+  );
+  expect(dbgAdopt, 'noteServerRevision must run from the WS full-sync path').toBe(true);
+  // The reload's full-sync also brought B's element into the canvas.
+  await expect
+    .poll(async () => (await readServerElements(aPage, roomId)).length, { timeout: 10_000 })
+    .toBe(2);
+
+  await aContext.close();
+  await bContext.close();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // RELOAD PERSISTENCE (offline): the offline reload now re-boots the canvas
 // via the cached '/shell' document (see the offline-navigation tests above).
 // What this test pins is DATA SAFETY: the outbox rows and the dirty room

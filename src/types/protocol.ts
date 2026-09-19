@@ -19,7 +19,7 @@ export type ServerMessage =
   | { type: 'element-update'; elements: ExcalidrawElement[]; senderId: string }
   | { type: 'element-delete'; elementIds: string[]; senderId: string }
   | { type: 'cursor-move'; userId: string; x: number; y: number; username: string }
-  | { type: 'full-sync'; elements: ExcalidrawElement[] }
+  | { type: 'full-sync'; elements: ExcalidrawElement[]; revision?: number; lastEditAt?: number }
   | { type: 'pong' }
   | { type: 'user-joined'; userId: string; username: string; userCount: number }
   | { type: 'user-left'; userId: string; userCount: number };

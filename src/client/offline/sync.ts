@@ -70,6 +70,49 @@ export function currentRevision(): number {
   return currentBase.revision;
 }
 
+/**
+ * Adopt a server-observed revision as the local base. Every time the server
+ * hands us authoritative state — the WS full-sync reply (and any future
+ * broadcast that carries a revision) — the local base must advance with it.
+ * Otherwise an online session delivered entirely over WS leaves a stale base
+ * behind, and the NEXT outbox replay diverges against a server that already
+ * holds everything: a spurious "conflict" fork prompt.
+ *
+ * Semantics mirror the 'synced' branch of syncIfNeeded:
+ * - only forward: the revision can never go backwards;
+ * - dirty stays true while outbox rows exist — adoption is bookkeeping only,
+ *   it never claims the queue has been drained;
+ * - the persisted room snapshot is updated too, so a reload does not inherit
+ *   a stale base;
+ * - skipped while a replay is reconciling: adopting a revision mid-replay
+ *   could desynchronise the very baseRevision the in-flight replay compares
+ *   against (a genuine divergence must not be accidentally "absorbed" by a
+ *   full-sync that races it).
+ */
+export async function noteServerRevision(revision: number, lastEditAt?: number): Promise<void> {
+  if (!currentRoom || !Number.isFinite(revision)) return;
+  if (reconciling) {
+    log('full-sync-rev', `SKIP room=${currentRoom} revision=${revision} reconciling=true`);
+    return;
+  }
+  if (revision <= currentBase.revision) return;
+
+  const hadOutbox = (await db.getEvents(currentRoom)).length > 0;
+  log('full-sync-rev', `adopt room=${currentRoom} revision=${revision} outbox=${hadOutbox} lastEditAt=${lastEditAt ?? 'n/a'}`);
+
+  currentBase = { revision, lastEditAt: lastEditAt ?? currentBase.lastEditAt };
+  // The snapshot's revision is advanced regardless (a reload must not inherit
+  // the stale base); `dirty` is untouched here — the 'synced'-branch contract
+  // (dirty only clears when the outbox is actually drained) is preserved by
+  // leaving queued rows in place and never clearing dirty on this path.
+  const local = await db.getRoom(currentRoom);
+  if (local) {
+    local.revision = revision;
+    local.lastEditAt = lastEditAt ?? local.lastEditAt;
+    await db.saveRoom(local);
+  }
+}
+
 /** Append a user mutation to the outbox and mark the room dirty. */
 export async function enqueue(roomId: string, op: OfflineOp, revision: number): Promise<void> {
   await db.appendEvent(roomId, op, revision);
@@ -173,6 +216,18 @@ async function replayOutbox(roomId: string, events: Awaited<ReturnType<typeof db
 async function handleDivergence(roomId: string, server: ServerState): Promise<void> {
   const events = await db.getEvents(roomId);
 
+  // We may have flipped offline between enqueueing the ops and this
+  // reconciliation (network restored then dropped again mid-flight). Asking
+  // the user to fork while they cannot reach the server — or while the server
+  // is merely UNREACHABLE, not ahead — is exactly the spurious-conflict class
+  // the owner reported. Abort the fork offer; the outbox stays queued and the
+  // next online transition retries the whole reconciliation.
+  if (!isOnline()) {
+    log('handleDivergence', `offline during reconcile — no fork offer, keeping ${events.length} events`);
+    emitStatus('offline', 'Local changes kept — will retry when back online');
+    return;
+  }
+
   // First try to drain benignly: either there are no local edits (adopt the
   // server), or the server already holds our queued ops (they were delivered
   // live over the WebSocket, e.g. during a "believed-offline" race). Only if a
@@ -220,9 +275,22 @@ async function tryBenignDrain(
 
   // Case 0: the server already reflects our queued ops. On reconnect a buffered
   // WebSocket frame and the /events replay can race, so the "diverged" snapshot
-  // may not yet include the op the WS is about to deliver. Briefly re-poll the
-  // authoritative /state to give it time to settle before giving up.
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // may not yet include the op the WS is about to deliver. Poll the
+  // authoritative /state on a DEADLINE, not an attempt count: a reconnecting
+  // network can leave /state unreachable for many seconds, and giving up early
+  // offers a fork for a conflict that does not exist. The loop keeps polling
+  // until the deadline while the machine believes it is online; if connectivity
+  // drops mid-loop the deadline is extended by the offline duration (capped),
+  // so an offline stretch never burns the settle budget. We only conclude a
+  // real conflict once the deadline expires while online with successful,
+  // non-matching fetches.
+  const SETTLE_WINDOW_MS = 10_000; // total settle budget while online
+  const SETTLE_POLL_MS = 500; // poll cadence for /state
+  const OFFLINE_CAP_MS = 30_000; // never extend beyond 30s of offline stretching
+  let deadline = Date.now() + SETTLE_WINDOW_MS;
+  const hardDeadline = deadline + OFFLINE_CAP_MS;
+  let matched = false;
+  while (Date.now() < deadline) {
     if (serverHasAll(events, state.elements)) {
       dirty = false;
       currentBase = { revision: state.revision, lastEditAt: state.lastEditAt };
@@ -234,15 +302,47 @@ async function tryBenignDrain(
       local.dirty = false;
       await db.saveRoom(local);
       emitStatus('online', 'All changes synced');
-      log('tryBenignDrain', `attempt=${attempt} serverHasAll=TRUE draining ${events.length} events rev=${state.revision}`);
+      log('tryBenignDrain', `settled serverHasAll=TRUE draining ${events.length} events rev=${state.revision} elapsed=${SETTLE_WINDOW_MS - (deadline - Date.now())}ms`);
       return true;
     }
-    log('tryBenignDrain', `attempt=${attempt} serverHasAll=false stateRev=${state.revision} stateEls=${state.elements.length} outbox=${events.map(e => e.op.type === 'element-update' ? e.op.elements.map(x => `${x.id}@v${x.version}`).join(',') : e.op.elementIds.join(',')).join(';')}`);
+    if (!isOnline()) {
+      // The network dropped mid-settle: extend the deadline by the offline
+      // duration (capped) instead of burning the settle budget on fetches
+      // that cannot succeed.
+      if (Date.now() >= hardDeadline) {
+        log('tryBenignDrain', `offline cap of ${OFFLINE_CAP_MS}ms reached — giving up`);
+        return false;
+      }
+      const next = Math.min(deadline + SETTLE_POLL_MS, hardDeadline);
+      log('tryBenignDrain', `offline mid-settle — deadline extended to +${next - Date.now()}ms`);
+      await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
+      deadline = next;
+      continue;
+    }
     const res = await fetch(`/api/rooms/${roomId}/state`).catch(() => null);
-    if (res && res.ok) state = await res.json();
-    await new Promise((r) => setTimeout(r, 250));
+    if (res && res.ok) {
+      state = await res.json();
+      matched = true;
+      log('tryBenignDrain', `state fetched: rev=${state.revision} els=${state.elements.length} outbox=${events.map((e) => e.op.type === 'element-update' ? e.op.elements.map((x: { id: string; version: number }) => `${x.id}@v${x.version}`).join(',') : e.op.elementIds.join(',')).join(';')}`);
+    } else {
+      // Transient failure (the network is still restoring): retry on the next
+      // tick — a failed fetch is not evidence of a conflict.
+      log('tryBenignDrain', `state fetch failed — retrying until deadline (online=${isOnline()})`);
+    }
+    await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
   }
-  log('tryBenignDrain', `GAVE UP after 6 attempts`);
+  // Deadline expired. Only conclude a REAL conflict when the server was
+  // actually reachable during the window (successful /state fetches whose
+  // snapshots never matched). An unreachable server — or a settle window
+  // spent offline — is not evidence of a conflict: defer to the retry path
+  // (keep the outbox, no fork prompt) instead of fast-failing into a fork.
+  if (!isOnline() || !matched) {
+    log('tryBenignDrain', `settle window expired without a conclusive /state (online=${isOnline()} matched=${matched}) — deferring, no fork`);
+    dirty = true;
+    emitStatus('offline', 'Local changes kept — will retry when back online');
+    return true;
+  }
+  log('tryBenignDrain', `GAVE UP after settle window (matched=${matched} stateRev=${state.revision})`);
   return false;
 }
 

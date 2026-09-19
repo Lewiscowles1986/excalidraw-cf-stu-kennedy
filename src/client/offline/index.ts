@@ -7,6 +7,7 @@ export {
   answerFork,
   currentRoomId,
   currentRevision,
+  noteServerRevision,
 } from './sync';
 export {
   isOnline,

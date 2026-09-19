@@ -2,7 +2,7 @@ import type { ExcalidrawElement } from './types';
 import type { ClientMessage, ServerMessage } from '../types/protocol';
 import { store } from './state';
 import { updateRemoteCursor, removeRemoteCursor } from './renderer';
-import { enqueue, currentRevision, currentRoomId } from './offline';
+import { enqueue, currentRevision, currentRoomId, noteServerRevision } from './offline';
 import type { Connectivity } from './offline/connectivity';
 import { isOnline, subscribeConnectivity } from './offline/connectivity';
 import { getStableUserId } from './identity';
@@ -145,6 +145,14 @@ class WebSocketClient {
     switch (msg.type) {
       case 'full-sync':
         store.updateElements(msg.elements);
+        // Bookkeeping: absorb the room revision the server stamped on the
+        // snapshot, so WS-delivered sessions leave no stale base behind (the
+        // next outbox replay must not diverge against a server we are fully
+        // in sync with). Adoption is skipped while a replay is mid-flight;
+        // see noteServerRevision.
+        if (msg.revision != null) {
+          noteServerRevision(msg.revision, msg.lastEditAt);
+        }
         break;
       case 'element-update':
         if (msg.senderId !== this.userId && msg.senderId !== 'offline-sync') {
