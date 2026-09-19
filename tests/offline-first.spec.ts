@@ -320,24 +320,97 @@ test('queued offline edits drain to the server once back online', async ({ page,
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// OFFLINE START: whether the canvas page can OPEN directly from the cached
-// shell offline. This currently requires the SW nav-fallback work described in
-// docs/build-system.md ("What next — reach the canvas"). Until that lands, the
-// reload-offline path is not expected to render the canvas, so we skip rather
-// than assert behavior that isn't implemented yet.
+// OFFLINE NAVIGATION: the SW's navigation handler is now NETWORK-FIRST (fresh
+// SSR while online) with a route-aware offline fallback — /d/:id, /new and
+// /join fall back to the precached '/shell' canvas document (everything else
+// to the cached landing page), so the canvas itself is reachable with no
+// server. Implemented per docs/build-system.md "What next" options 1+2
+// combined (the /shell route + client-side route reconciliation in
+// src/client/canvas.ts).
 // ═══════════════════════════════════════════════════════════════════════════
-test.skip('the canvas page itself stays reachable offline via the cached shell', async ({ page, context }) => {
+test('the canvas page itself stays reachable offline via the cached shell', async ({ page, context }) => {
   const roomId = await loadOnline(page);
   await ensureServiceWorkerReady(page);
 
-  // go offline, then reload — the SW should serve the cached shell
-  await goOffline(context, page);
+  // Warm pass: one SW-CONTROLLED online load so the runtime cache holds the
+  // dev module graph (the dev precache lists only entry modules; in a
+  // production build the manifest covers every chunk, so this step is a
+  // dev-test necessity, not an app requirement).
   await page.reload();
   await page.waitForSelector('#excalidraw-canvas');
+
+  // go offline, then reload — the SW should serve the cached canvas shell
+  await goOffline(context, page);
+  await page.reload();
+  await page.waitForSelector('#excalidraw-canvas', { timeout: 20_000 });
 
   // still offline (SW shell did not hit the network)
   await expect(page.locator('#offline-banner')).toBeVisible();
   expect(page.url()).toMatch(/\/d\//);
+  expect(page.url()).toContain(`/d/${roomId}`);
+});
+
+// The user flow "New Drawing" offline: the server /new redirect is
+// unreachable, so the SW serves the cached shell and the CLIENT mints the
+// room id, rewrites the URL to /d/<id> and boots the canvas against it.
+test('offline navigation to /new mints a room and boots the canvas', async ({ page, context }) => {
+  // Warm the SW cache with the full module graph (online load).
+  await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+
+  // Back to the landing page while STILL ONLINE (the user is on '/' when the
+  // connection drops, then clicks "New Drawing" — the canvas page has no such
+  // button, so the join-style goto-landing pattern keeps it the real flow).
+  await page.goto('/');
+  await ensureServiceWorkerReady(page);
+  await goOffline(context, page);
+
+  // The user flow: click "New Drawing" (not a goto).
+  await Promise.all([
+    page.waitForURL(/\/d\//, { timeout: 20_000 }),
+    page.click('text=New Drawing'),
+  ]);
+  await page.waitForSelector('#excalidraw-canvas', { timeout: 20_000 });
+  await expect(page.locator('#offline-banner')).toBeVisible();
+
+  // A room was minted client-side and the URL carries it.
+  const minted = page.url().match(/\/d\/(.+)$/)?.[1];
+  expect(minted).toBeTruthy();
+
+  // The booted canvas is fully functional offline: an edit lands in the
+  // outbox for the minted room (server-blind, so no state fetch needed).
+  await drawRectangle(page);
+  await page.waitForTimeout(600);
+  expect(await queuedOpCount(page)).toBeGreaterThan(0);
+});
+
+// Offline join: navigating to /join?room=X offline must boot the cached room
+// (the client resolves the query param into /d/<room> before the /d/ match).
+test('offline join via /join?room=X boots the cached room', async ({ page, context }) => {
+  // Create room A online (same context ⇒ same IndexedDB for the join).
+  const roomA = await loadOnline(page);
+  await ensureServiceWorkerReady(page);
+
+  // Back to the landing page while STILL ONLINE (join flow, not reload path).
+  await page.goto('/');
+  await ensureServiceWorkerReady(page);
+  await goOffline(context, page);
+
+  // Use the join FORM (the user flow): fill room A's id and submit.
+  await page.fill('.join-input', roomA);
+  await Promise.all([
+    page.waitForURL(new RegExp(`/d/${roomA}`), { timeout: 20_000 }),
+    page.click('.join-form button'),
+  ]);
+  await page.waitForSelector('#excalidraw-canvas', { timeout: 20_000 });
+  await expect(page.locator('#offline-banner')).toBeVisible();
+  expect(page.url()).toContain(`/d/${roomA}`);
+
+  // The canvas boots and is functional: an offline edit queues for room A.
+  // (Room A may have no local snapshot on this fresh page — that's fine.)
+  await drawRectangle(page);
+  await page.waitForTimeout(600);
+  expect(await queuedOpCount(page)).toBeGreaterThan(0);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -467,11 +540,11 @@ test('diverged replay after a server-side edit keeps local data and offers a for
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// RELOAD PERSISTENCE (offline): the SW-served shell currently lands on the
-// landing page (nav-fallback for /d/:id is not implemented — see the skipped
-// test above), so the canvas itself cannot be asserted here. What MUST hold
-// is data safety: the outbox rows and the dirty room snapshot survive the
-// reload untouched, so nothing queued can ever be lost by a refresh.
+// RELOAD PERSISTENCE (offline): the offline reload now re-boots the canvas
+// via the cached '/shell' document (see the offline-navigation tests above).
+// What this test pins is DATA SAFETY: the outbox rows and the dirty room
+// snapshot survive the reload untouched, so nothing queued can ever be lost
+// by a refresh (the re-booted canvas must not re-enqueue anything on restore).
 // ═══════════════════════════════════════════════════════════════════════════
 test('offline outbox rows and room snapshot survive a page reload', async ({ page, context }) => {
   // 1–5. online, SW ready, then offline

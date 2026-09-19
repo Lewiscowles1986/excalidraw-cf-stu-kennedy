@@ -356,14 +356,15 @@ The offline layer already handles the *hard part* (edits, IndexedDB, sync, fork)
 The gap is purely that the *route to the canvas* currently comes from the server.
 Options, roughly in increasing effort:
 
-1. **Rely on the service-worker navigation fallback.** `sw.js` already serves the
-   cached `/` shell for *any* navigation request (an SPA-style fallback). Since the
-   client reads the `roomId` straight from `location.pathname` and the offline
-   modules restore from IndexedDB, this can already let a known room open offline —
-   it just needs to be validated and made a first-class path.
-2. **Precache the room route(s).** Add the room page (and the landing page) to the
-   generated precache so `/d/:roomId` is deliberately served from cache even on a
-   cold offline start.
+1. ~~**Rely on the service-worker navigation fallback.**~~ **IMPLEMENTED** — the
+   SW's navigation handler is now *network-first* with a route-aware offline
+   fallback: `/d/:roomId`, `/new` and `/join` fall back to the precached
+   `/shell` canvas document (everything else to the cached landing page).
+2. ~~**Precache the room route(s).**~~ **IMPLEMENTED (combined with 1)** — a
+   dedicated `/shell` route (same `DrawingPage` SSR, no roomId) is precached in
+   both dev and build lists; the client derives the real room from
+   `location.pathname` at boot (`src/client/canvas.ts` mints `/new` rooms and
+   resolves `/join?room=X` offline).
 3. **Prerender the shell from the build** instead of at request time (move the
    SSR template from `renderer.tsx` into static HTML during `vite build`). This is
    the bigger architectural move: it removes the server from the *page-delivery*

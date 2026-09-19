@@ -16,12 +16,11 @@ import path from 'node:path';
 
 // Opens a fresh drawing room and waits for the canvas to be interactive.
 // NOTE for multi-room scenarios: once this page's service worker is active
-// (dev SW registers on load), ANY later navigation in the same context —
-// including /new and /d/:id — is answered with the cached '/' shell (nav
-// fallback for non-'/' routes is not implemented; see the skipped test in
-// offline-first.spec.ts). A second room must therefore open in a FRESH
-// browser context, with the stable userId seeded via addInitScript so both
-// rooms attribute to the same device identity.
+// (dev SW registers on load), later navigations in the SAME context run
+// network-first (fresh SSR while online). A second room can therefore open
+// in a fresh browser context for isolation (separate IndexedDB per context),
+// with the stable userId seeded via addInitScript so both rooms attribute to
+// the same device identity.
 async function openCanvas(page: Page): Promise<string> {
   await page.goto('/');
   await Promise.all([

@@ -44,16 +44,37 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Navigation requests: serve the cached shell, falling back to network.
+  // Navigation requests: NETWORK-FIRST with a route-aware offline fallback.
+  // Online the real SSR page is served (always fresh); offline the fallback
+  // document depends on the URL shape:
+  //   /d/:roomId, /new, /join  → the precached '/shell' canvas document
+  //                              (the client derives the room from the URL at
+  //                              boot — see src/client/canvas.ts), falling
+  //                              back to '/' if the shell is somehow missing;
+  //   anything else            → the precached landing page '/'.
+  // If neither is cached, respond with a minimal inline 503 document rather
+  // than a network error.
+  //
+  // Navigations are deliberately NOT runtime-cached: the precache list already
+  // covers the two documents ('/' and '/shell'), and the cache name churns per
+  // build in dev anyway — caching fetched navigations would only risk serving
+  // stale HTML the next time the network hiccups.
   if (request.mode === 'navigate') {
     event.respondWith(
-      caches.match('/').then((cached) => {
-        if (cached) return cached;
-        return fetch(request).then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put('/', copy));
-          return res;
-        });
+      fetch(request).catch(() => {
+        const path = url.pathname;
+        const canvasShaped =
+          path.startsWith('/d/') || path === '/new' || path === '/join';
+        return (canvasShaped ? caches.match('/shell') : Promise.resolve(undefined))
+          .then((shell) => shell || caches.match('/'))
+          .then(
+            (cached) =>
+              cached ||
+              new Response(
+                '<!doctype html><title>Offline</title><p>Excalidraw-CF is offline and this page was not cached. Reconnect and reload.</p>',
+                { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+              ),
+          );
       }),
     );
     return;

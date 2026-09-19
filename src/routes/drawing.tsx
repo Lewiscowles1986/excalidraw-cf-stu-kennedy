@@ -45,6 +45,15 @@ app.get('/join', (c) => {
   return c.redirect(`/d/${room}`);
 });
 
+// Offline canvas shell: the same DrawingPage SSR'd WITHOUT a roomId. The
+// service worker precaches this document and serves it for offline
+// navigations to /d/:roomId, /new and /join — the client then derives the
+// real roomId from location.pathname at boot (see src/client/canvas.ts),
+// so one cached document covers every canvas-shaped URL.
+app.get('/shell', (c) => {
+  return c.render(<DrawingPage />);
+});
+
 // Drawing room page
 app.get('/d/:roomId', (c) => {
   const roomId = c.req.param('roomId');

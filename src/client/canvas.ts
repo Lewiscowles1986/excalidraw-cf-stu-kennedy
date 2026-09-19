@@ -32,6 +32,29 @@ export function init(): void {
   startConnectivityMonitor();
   setupOfflineUI();
 
+  // Offline route reconciliation, BEFORE the /d/ match. When the SW served
+  // the precached '/shell' document instead of the server redirect (i.e. we
+  // are offline), /new and /join arrive as-is and are resolved client-side;
+  // online these still server-redirect (network-first SW passes through) and
+  // both paths converge on /d/:id.
+  const path = location.pathname;
+  if (path === '/new') {
+    // Offline-friendly room minting: /new's server redirect is unavailable
+    // offline (the SW serves the shell instead), so mint client-side.
+    const id = crypto.randomUUID().substring(0, 8);
+    history.replaceState(null, '', `/d/${id}`);
+  } else if (path === '/join') {
+    const room = new URLSearchParams(location.search).get('room');
+    if (!room) {
+      // replaceState would leave the roomless shell inert (toolbar alive, no
+      // render loop); location.replace('/') boots the real landing — offline
+      // the SW serves the precached '/' document.
+      location.replace('/');
+      return;
+    }
+    history.replaceState(null, '', `/d/${room}`);
+  }
+
   // Center the view
   store.setAppState({
     scrollX: window.innerWidth / 2,

@@ -30,7 +30,9 @@ function serviceWorkerPlugin(): Plugin {
     configureServer(server) {
       // Dev: write a generated sw.js into public/ so /sw.js is served while
       // developing. The dev asset paths are the real ones Vite serves.
-      const devAssets = new Set<string>(['/', '/src/style.css', '/src/client/canvas.ts'])
+      // '/shell' is the offline canvas document (server route in
+      // routes/drawing.tsx) — kept in lockstep with the build list below.
+      const devAssets = new Set<string>(['/', '/shell', '/src/style.css', '/src/client/canvas.ts'])
       writeFileSync(resolve(rootDir, 'public/sw.js'), renderTemplate(devAssets))
       server.watcher.on('change', (file) => {
         if (String(file).endsWith('service-worker.template.js')) {
@@ -52,8 +54,11 @@ function serviceWorkerPlugin(): Plugin {
       >
 
       // Collect the real built assets Vite emitted (JS/CSS entries), plus the
-      // offline precache shell. Always include the document '/'.
-      const assets = new Set<string>(['/'])
+      // offline precache documents: the landing shell '/' and the canvas
+      // shell '/shell' (served by the SW's route-aware navigation fallback
+      // for /d/:roomId, /new and /join when offline). MUST stay in lockstep
+      // with the dev list above.
+      const assets = new Set<string>(['/', '/shell'])
       for (const entry of Object.values(manifest)) {
         if (entry?.file && /\.(js|css)$/.test(entry.file)) {
           assets.add('/' + entry.file)
